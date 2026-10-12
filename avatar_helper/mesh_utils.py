@@ -94,14 +94,6 @@ def vertex_normals(verts, tris):
     return normalize(vn)
 
 
-def triangle_frames(verts, tris):
-    """Orthonormal (tangent, bitangent, normal) frame per triangle."""
-    a = verts[tris[:, 0]]
-    e1 = normalize(verts[tris[:, 1]] - a)
-    n = face_normals(verts, tris)
-    e2 = np.cross(n, e1)
-    return e1, e2, n
-
 
 def barycentric(p, a, b, c):
     v0, v1, v2 = b - a, c - a, p - a
@@ -203,19 +195,23 @@ def islands(n, edges):
     return labels.ravel()
 
 
-def similarity_fit(src, dst):
-    """Best rotation + uniform scale + translation mapping src onto dst; returns transformed src."""
-    ms, md = src.mean(0), dst.mean(0)
+def similarity_parts(src, dst):
+    """Best (scale, rotation) mapping src onto dst about their centroids."""
     if len(src) < 3:
-        return src + (md - ms)
-    xs, xd = src - ms, dst - md
+        return 1.0, np.eye(3)
+    xs, xd = src - src.mean(0), dst - dst.mean(0)
     u, sv, vt = np.linalg.svd(xs.T @ xd / len(src))
     d = np.sign(np.linalg.det(vt.T @ u.T)) or 1.0
     dm = np.diag([1.0, 1.0, d])
-    rot = vt.T @ dm @ u.T
     var = (xs ** 2).sum() / len(src)
     scale = np.trace(np.diag(sv) @ dm) / var if var > 1e-12 else 1.0
-    return scale * xs @ rot.T + md
+    return scale, vt.T @ dm @ u.T
+
+
+def similarity_fit(src, dst):
+    """Best rotation + uniform scale + translation mapping src onto dst; returns transformed src."""
+    scale, rot = similarity_parts(src, dst)
+    return scale * (src - src.mean(0)) @ rot.T + dst.mean(0)
 
 
 def voxel_downsample(points, values, size, max_points):

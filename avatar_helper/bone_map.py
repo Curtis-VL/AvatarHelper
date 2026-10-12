@@ -169,7 +169,10 @@ def humanoid_map(bones):
 
     fingers = {}
     for name, d, key, side in finger_candidates:
-        side = ancestor_hand_side(name) or side
+        hand = ancestor_hand_side(name)
+        if hand is None and f"hand.{side}" in result:
+            continue  # not on the hand: an accessory bone, e.g. a harness's "Spine Ring L"
+        side = hand or side
         if side:
             fingers.setdefault((key, side), []).append((d, name))
 

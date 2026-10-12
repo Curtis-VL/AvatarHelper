@@ -1,14 +1,20 @@
 """Calibration: learn where every point of the source body ends up on the target body.
 
-The result is stored as a mesh object (a copy of the posed source body) with a
-"Fitted" shape key holding the matching target positions. Sliding that key from 0 to 1
-morphs the source body onto the target, which is how the user checks the calibration,
-and the key can be sculpted by hand to fix problem areas.
+The source rig is first posed to match the target's limb directions, then the source body
+is matched onto the target body. The result is saved as a conversion (see conversions.py)
+for reuse without the source avatar, and kept in the scene as a hidden preview mesh: a copy
+of the posed source body with a "Fitted" shape key holding the matching target positions.
+Sliding that key from 0 to 1 morphs the source body onto the target, and the key can be
+sculpted by hand to fix problem areas, then saved again.
 """
+import json
+
 import bpy
 import numpy as np
 
+from . import conversions
 from . import mesh_utils as mu
+from . import rig
 from .rbf import RBFWarp, dedupe_pairs
 from .rig import deforming_armatures, extremity_pairs, joint_pairs, landmark_pairs
 
@@ -27,25 +33,77 @@ def output_collection(scene, name=OUTPUT_COLLECTION):
     return coll
 
 
-def source_armature(s):
-    if s.source_armature:
-        return s.source_armature
-    arms = deforming_armatures(s.source_body) if s.source_body else []
+def body_armature(body, chosen=None):
+    """The armature that deforms `body`. An armature set by hand is only used if it is one of
+    them, or if the body has no Armature modifier: posing any other rig (e.g. a clothing
+    armature) wouldn't move the body, and the calibration would come out wrong."""
+    arms = deforming_armatures(body) if body else []
+    if chosen in arms or (chosen and not arms):
+        return chosen
     return arms[0] if arms else None
+
+
+def source_armature(s):
+    return body_armature(s.source_body, s.source_armature)
 
 
 def target_armature(s):
-    if s.target_armature:
-        return s.target_armature
-    arms = deforming_armatures(s.target_body) if s.target_body else []
-    return arms[0] if arms else None
+    return body_armature(s.target_body, s.target_armature)
+
+
+def conversion_name(s):
+    return s.conversion_name.strip() or f"{s.source_body.name} > {s.target_body.name}"
+
+
+def create_conversion(context, s, progress=None):
+    """Match the pose, calibrate, and save the result as a conversion. The source rig is
+    left as it was."""
+    src_body, tgt_body = s.source_body, s.target_body
+    if not src_body or not tgt_body:
+        raise ValueError("Set both the source and target body meshes")
+    src_arm, tgt_arm = source_armature(s), target_armature(s)
+    if not src_arm or not tgt_arm:
+        raise ValueError("Both bodies need an armature (set it, or give the body an Armature modifier)")
+
+    posed_arms = {src_arm, *deforming_armatures(src_body)}
+    with rig.rest_pose(context, posed_arms):
+        src_joints = conversions.rest_joints(src_arm)
+        src_feet = rig.foot_frames(context, src_body, src_arm)
+        rig.match_pose(context, src_arm, tgt_arm, [a for a in posed_arms if a is not src_arm], src_body, tgt_body)
+        pose = conversions.capture_pose(src_arm)
+        stats = calibrate(context, s, progress)
+    meta = {
+        "name": conversion_name(s), "source": src_body.name, "target": tgt_body.name,
+        "src_joints": {k: v.tolist() for k, v in src_joints.items()},
+        "tgt_joints": {k: v.tolist() for k, v in conversions.posed_joints(tgt_arm).items()},
+        "pose": {k: v.tolist() for k, v in pose.items()},
+        "src_feet": {k: [np.asarray(x).tolist() for x in v] for k, v in src_feet.items()},
+    }
+    cal = s.calibration
+    cal["ah_conversion"] = json.dumps(meta)
+    stats["conversion"] = save_conversion(s, cal)
+    return stats
+
+
+def save_conversion(s, cal):
+    """Save the calibration object (with any hand edits to its "Fitted" key) as a conversion."""
+    meta = json.loads(cal["ah_conversion"])
+    if s.conversion_name.strip():
+        meta["name"] = s.conversion_name.strip()
+    keys = cal.data.shape_keys
+    n = len(cal.data.vertices)
+    base = mu.transform_points(cal.matrix_world, mu.read_shape_key(keys.reference_key, n))
+    fitted = mu.transform_points(cal.matrix_world, mu.read_shape_key(keys.key_blocks[CALIBRATION_KEY], n))
+    _co, tris, _edges = mu.mesh_arrays(cal.data)
+    conv = conversions.Conversion.from_meta(meta, base, fitted, tris)
+    stem = conversions.file_stem(conv.name)
+    conv.save(conversions.path_for(stem))
+    s.conversion = stem
+    return conv.name
 
 
 def calibrate(context, s, progress=None):
     src_body, tgt_body = s.source_body, s.target_body
-    if not src_body or not tgt_body:
-        raise ValueError("Set both the source and target body meshes")
-
     dg = context.evaluated_depsgraph_get()
 
     old = s.calibration
@@ -118,6 +176,9 @@ def calibrate(context, s, progress=None):
         pass
 
     s.calibration = cal
+    # Only for checking and hand-fixing the calibration; otherwise it just overlaps the target.
+    cal.hide_set(not s.show_calibration)
+    cal.hide_render = True
     return {
         "joints": len(pairs) - len(landmarks) - len(tips),
         "tips": len(tips),

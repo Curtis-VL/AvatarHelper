@@ -1,7 +1,9 @@
 import bpy
 
-from . import calibration, fitting, layers, rig
+from . import calibration, conversions, fitting, layers, rig
 from .bone_map import missing_required
+
+HIGH_ERROR = 0.003  # metres; a good calibration is well under 1 mm on average
 
 
 def _ensure_object_mode(context):
@@ -50,50 +52,90 @@ class AH_OT_check_bones(bpy.types.Operator):
         return {'FINISHED'}
 
 
-def _follower_armatures(s, src_arm):
-    arms = []
-    objs = [it.obj for it in s.clothing if it.obj] + ([s.source_body] if s.source_body else [])
-    for o in objs:
-        for a in rig.deforming_armatures(o):
-            if a is not src_arm and a not in arms:
-                arms.append(a)
-    return arms
+def _conversion_items(_self, _context):
+    # Blender needs the strings kept alive while the menu is open.
+    _conversion_items.cache = [(stem, name, "") for stem, name in conversions.list_library()] or \
+        [("", "(no conversions saved yet)", "")]
+    return _conversion_items.cache
 
 
-class AH_OT_match_pose(bpy.types.Operator):
-    bl_idname = "avatar_helper.match_pose"
-    bl_label = "Match Pose"
-    bl_description = ("Pose the source armature (and the clothing's armatures) so its limbs point the same way "
-                      "as the target's, e.g. A-pose to T-pose")
-    bl_options = {'REGISTER', 'UNDO'}
+class AH_OT_choose_conversion(bpy.types.Operator):
+    bl_idname = "avatar_helper.choose_conversion"
+    bl_label = "Choose Conversion"
+    bl_description = "Pick a saved conversion (source base > target avatar) to fit clothing with"
+    bl_property = "conversion"
+
+    conversion: bpy.props.EnumProperty(items=_conversion_items)
+
+    def invoke(self, context, _event):
+        context.window_manager.invoke_search_popup(self)
+        return {'RUNNING_MODAL'}
 
     def execute(self, context):
-        s = context.scene.avatar_helper
-        src, tgt = calibration.source_armature(s), calibration.target_armature(s)
-        if not src or not tgt:
-            self.report({'ERROR'}, "Source and target armatures are required")
-            return {'CANCELLED'}
-        _ensure_object_mode(context)
-        followers = _follower_armatures(s, src)
-        n = rig.match_pose(context, src, tgt, followers, s.source_body, s.target_body)
-        self.report({'INFO'}, f"Rotated {n} bones; {len(followers)} clothing armature(s) followed")
+        if self.conversion:
+            context.scene.avatar_helper.conversion = self.conversion
         return {'FINISHED'}
 
 
-class AH_OT_reset_pose(bpy.types.Operator):
-    bl_idname = "avatar_helper.reset_pose"
-    bl_label = "Reset Pose"
-    bl_description = "Clear the pose on the source armature and the clothing's armatures"
+class AH_OT_open_conversions(bpy.types.Operator):
+    bl_idname = "avatar_helper.open_conversions"
+    bl_label = "Open Conversions Folder"
+    bl_description = "Open the folder conversions are saved in (to share, back up or delete them)"
+
+    def execute(self, _context):
+        bpy.ops.wm.path_open(filepath=conversions.library_dir())
+        return {'FINISHED'}
+
+
+class AH_OT_create_conversion(bpy.types.Operator):
+    bl_idname = "avatar_helper.create_conversion"
+    bl_label = "Create Conversion"
+    bl_description = ("Match the source rig's pose to the target, learn how the source body maps onto the target "
+                      "body, and save it as a conversion for fitting any outfit made for this base")
     bl_options = {'REGISTER', 'UNDO'}
 
     def execute(self, context):
         s = context.scene.avatar_helper
-        src = calibration.source_armature(s)
-        arms = ([src] if src else []) + _follower_armatures(s, src)
         _ensure_object_mode(context)
-        for a in arms:
-            rig.reset_pose(a)
-        context.view_layer.update()
+        try:
+            with _Progress(context) as progress:
+                stats = calibration.create_conversion(context, s, progress)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        except OSError as e:
+            self.report({'ERROR'}, f"Couldn't save the conversion: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, "Saved conversion '{conversion}' ({joints} joints, {tips} tips, {landmarks} landmarks). "
+                              "Surface error: mean {m:.1f} mm, 95% {p:.1f} mm, max {x:.1f} mm".format(
+                                  m=stats["mean_error"] * 1000, p=stats["p95_error"] * 1000,
+                                  x=stats["max_error"] * 1000, **stats))
+        if stats["mean_error"] > HIGH_ERROR:
+            self.report({'WARNING'}, "The bodies didn't match up well. Check both bodies are the right meshes "
+                                     "(Check Bone Mapping, and Show Calibration for the error map)")
+        return {'FINISHED'}
+
+
+class AH_OT_save_conversion(bpy.types.Operator):
+    bl_idname = "avatar_helper.save_conversion"
+    bl_label = "Save Calibration Edits"
+    bl_description = ("Save the calibration preview mesh again, including hand edits to its 'Fitted' shape key, "
+                      "as the conversion")
+    bl_options = {'REGISTER'}
+
+    @classmethod
+    def poll(cls, context):
+        cal = context.scene.avatar_helper.calibration
+        return cal is not None and "ah_conversion" in cal
+
+    def execute(self, context):
+        s = context.scene.avatar_helper
+        try:
+            name = calibration.save_conversion(s, s.calibration)
+        except OSError as e:
+            self.report({'ERROR'}, f"Couldn't save the conversion: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Saved conversion '{name}'")
         return {'FINISHED'}
 
 
@@ -143,28 +185,6 @@ class AH_OT_clear_landmarks(bpy.types.Operator):
         return {'FINISHED'}
 
 
-class AH_OT_calibrate(bpy.types.Operator):
-    bl_idname = "avatar_helper.calibrate"
-    bl_label = "Calibrate"
-    bl_description = "Learn how the source body maps onto the target body"
-    bl_options = {'REGISTER', 'UNDO'}
-
-    def execute(self, context):
-        s = context.scene.avatar_helper
-        _ensure_object_mode(context)
-        try:
-            with _Progress(context) as progress:
-                stats = calibration.calibrate(context, s, progress)
-        except ValueError as e:
-            self.report({'ERROR'}, str(e))
-            return {'CANCELLED'}
-        self.report({'INFO'}, "Calibrated from {joints} joints, {tips} tips, {landmarks} landmarks. Surface error: "
-                              "mean {m:.1f} mm, 95% {p:.1f} mm, max {x:.1f} mm".format(
-                                  m=stats["mean_error"] * 1000, p=stats["p95_error"] * 1000,
-                                  x=stats["max_error"] * 1000, **stats))
-        return {'FINISHED'}
-
-
 def _unique_clothing(s):
     objs = []
     for it in s.clothing:
@@ -188,12 +208,17 @@ class AH_OT_sort_layers(bpy.types.Operator):
         _ensure_object_mode(context)
         rel, gaps = layers.source_layers(context, objs, s.source_body)
         order = layers.sort_order([o.name for o in objs], rel, gaps)
-        modes = {it.obj.name: it.mode for it in s.clothing if it.obj}
+        keep = ("mode", "solver", "custom_detail", "shape_detail")
+        settings = {}
+        for it in s.clothing:
+            if it.obj and it.obj.name not in settings:
+                settings[it.obj.name] = {k: getattr(it, k) for k in keep}
         s.clothing.clear()
         for name in order:
             item = s.clothing.add()
             item.obj = bpy.data.objects[name]
-            item.mode = modes.get(name, 'AUTO')
+            for k, v in settings.get(name, {}).items():
+                setattr(item, k, v)
         s.clothing_index = 0
         self.report({'INFO'}, "Layers: " + " < ".join(order))
         return {'FINISHED'}
@@ -289,11 +314,12 @@ class AH_OT_clothing_move(bpy.types.Operator):
 
 classes = (
     AH_OT_check_bones,
-    AH_OT_match_pose,
-    AH_OT_reset_pose,
+    AH_OT_choose_conversion,
+    AH_OT_open_conversions,
+    AH_OT_create_conversion,
+    AH_OT_save_conversion,
     AH_OT_add_landmark,
     AH_OT_clear_landmarks,
-    AH_OT_calibrate,
     AH_OT_sort_layers,
     AH_OT_fit,
     AH_OT_clothing_add,

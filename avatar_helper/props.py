@@ -1,5 +1,8 @@
 import bpy
-from bpy.props import BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty
+from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty,
+                       StringProperty)
+
+from . import conversions
 
 
 def _is_mesh(_self, obj):
@@ -8,6 +11,14 @@ def _is_mesh(_self, obj):
 
 def _is_armature(_self, obj):
     return obj.type == 'ARMATURE'
+
+
+SOLVERS = (
+    ('ELASTIC', "Shape-preserving",
+     "Solve for the whole garment at once, keeping its own shape: no bumps or crumpling, "
+     "slightly softer fit to body detail"),
+    ('DIRECT', "Direct", "Place each vertex on its own: follows the body most closely, but can come out bumpy"),
+)
 
 
 class AH_ClothingItem(bpy.types.PropertyGroup):
@@ -21,18 +32,43 @@ class AH_ClothingItem(bpy.types.PropertyGroup):
         ),
         default='AUTO',
     )
+    solver: EnumProperty(
+        name="Solver",
+        items=(('DEFAULT', "Default", "Use the solver chosen below the list"),) + SOLVERS,
+        default='DEFAULT',
+    )
+    custom_detail: BoolProperty(
+        name="Own Shape Detail",
+        description="Use this item's own Shape Detail instead of the one below the list (e.g. higher for a knit, "
+                    "lower for a skin-tight body suit)")
+    shape_detail: FloatProperty(
+        name="Shape Detail", default=0.05, min=0.002, soft_max=0.1, subtype='DISTANCE', unit='LENGTH',
+        description="Shape-preserving solver: detail smaller than this comes from the original garment, "
+                    "larger shape changes follow the target")
+
+
+def _show_calibration(self, _context):
+    if self.calibration and self.calibration.name in bpy.context.view_layer.objects:
+        self.calibration.hide_set(not self.show_calibration)
 
 
 class AH_Settings(bpy.types.PropertyGroup):
+    # Conversion
+    conversion: StringProperty(
+        name="Conversion", description="The saved conversion (source base > target avatar) used for fitting")
+    conversion_name: StringProperty(
+        name="Name", description='Name for a new conversion, e.g. "Manuka > Custom". '
+                                 'Defaults to "<source body> > <target body>"')
     source_armature: PointerProperty(
         name="Source Armature", type=bpy.types.Object, poll=_is_armature,
-        description="Armature of the avatar the clothing was made for. Auto-detected from the body if empty")
+        description="Only needed if the source body has no Armature modifier: the base avatar's own armature "
+                    "(not a clothing armature)")
     source_body: PointerProperty(
         name="Source Body", type=bpy.types.Object, poll=_is_mesh,
-        description="Body mesh of the avatar the clothing was made for")
+        description="Body mesh of the base avatar the clothing was made for, used only to create a conversion")
     target_armature: PointerProperty(
         name="Target Armature", type=bpy.types.Object, poll=_is_armature,
-        description="Armature of the avatar to fit to. Auto-detected from the body if empty")
+        description="Only needed if the target body has no Armature modifier: your avatar's armature")
     target_body: PointerProperty(
         name="Target Body", type=bpy.types.Object, poll=_is_mesh,
         description="Body mesh of the avatar to fit to")
@@ -40,7 +76,10 @@ class AH_Settings(bpy.types.PropertyGroup):
     # Calibration
     calibration: PointerProperty(
         name="Calibration", type=bpy.types.Object, poll=_is_mesh,
-        description="Calibration mesh (source body with a 'Fitted' shape key)")
+        description="Calibration preview mesh (source body with a 'Fitted' shape key)")
+    show_calibration: BoolProperty(
+        name="Show Calibration", default=False, update=_show_calibration,
+        description="Show the calibration preview mesh (hidden by default, as it overlaps the target body)")
     icp_iterations: IntProperty(
         name="Iterations", default=12, min=1, max=100,
         description="Surface-matching passes after the joint-based warp")
@@ -69,6 +108,12 @@ class AH_Settings(bpy.types.PropertyGroup):
     blend_distance: FloatProperty(
         name="Blend Range", default=0.03, min=0.0, soft_max=0.1, subtype='DISTANCE', unit='LENGTH',
         description="Distance over which skin-following fades into the smooth warp")
+    solver: EnumProperty(name="Solver", items=SOLVERS, default='ELASTIC',
+                         description="Solver for items set to Default")
+    shape_detail: FloatProperty(
+        name="Shape Detail", default=0.01, min=0.002, soft_max=0.05, subtype='DISTANCE', unit='LENGTH',
+        description="Shape-preserving solver, for items without their own: detail smaller than this comes from "
+                    "the original garment, larger shape changes follow the target")
     displacement_smoothing: IntProperty(
         name="Smoothing", default=4, min=0, max=100,
         description="Smooths the per-vertex movement (not the shape), keeping folds intact")
@@ -89,7 +134,18 @@ class AH_Settings(bpy.types.PropertyGroup):
     hide_originals: BoolProperty(name="Hide Originals", default=True)
 
 
-classes = (AH_ClothingItem, AH_Settings)
+class AH_Preferences(bpy.types.AddonPreferences):
+    bl_idname = __package__
+
+    conversions_dir: StringProperty(
+        name="Conversions Folder", subtype='DIR_PATH', default="",
+        description="Where conversions are saved. Empty uses " + conversions.default_library_dir())
+
+    def draw(self, _context):
+        self.layout.prop(self, "conversions_dir")
+
+
+classes = (AH_ClothingItem, AH_Settings, AH_Preferences)
 
 
 def register():
