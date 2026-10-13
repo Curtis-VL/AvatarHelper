@@ -15,7 +15,7 @@ from . import mesh_utils as mu
 
 def original_of(obj):
     """The garment a fitted copy was made from, with the same vertices."""
-    name = obj.get("ah_fitted_from")
+    name = obj.get("ah_fitted_from") or obj.get("ah_final_from")
     src = bpy.data.objects.get(name) if name else None
     if src is None or src.type != 'MESH':
         raise ValueError(f"'{obj.name}' isn't a fitted copy of an existing mesh")

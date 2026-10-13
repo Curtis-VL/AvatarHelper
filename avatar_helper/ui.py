@@ -164,6 +164,11 @@ class AH_PT_fit(_Panel, bpy.types.Panel):
         col.prop(s, "shape_detail")
         layout.operator("avatar_helper.fit", icon='MOD_CLOTH')
 
+        box = layout.box()
+        box.label(text="Happy with it?")
+        box.prop(s, "rig_to")
+        box.operator("avatar_helper.finalize", icon='CHECKMARK')
+
 
 class AH_PT_touchup(_Panel, bpy.types.Panel):
     bl_label = "Touch Up"
@@ -172,7 +177,7 @@ class AH_PT_touchup(_Panel, bpy.types.Panel):
     def draw(self, context):
         layout = self.layout
         o = context.edit_object or context.object
-        if not (o and o.get("ah_fitted_from")):
+        if not (o and ("ah_fitted_from" in o or "ah_final_from" in o)):
             layout.label(text="Select a fitted mesh, then Edit Mode", icon='INFO')
             return
         if context.mode != 'EDIT_MESH':

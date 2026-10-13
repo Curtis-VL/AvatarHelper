@@ -51,6 +51,14 @@ def target_armature(s):
     return body_armature(s.target_body, s.target_armature)
 
 
+def shape_key_values(obj):
+    """{shape key name: value} of a mesh (Basis left out)."""
+    keys = obj.data.shape_keys if obj and obj.type == 'MESH' else None
+    if keys is None:
+        return {}
+    return {kb.name: float(kb.value) for kb in keys.key_blocks if kb != keys.reference_key}
+
+
 def conversion_name(s):
     return s.conversion_name.strip() or f"{s.source_body.name} > {s.target_body.name}"
 
@@ -78,6 +86,10 @@ def create_conversion(context, s, progress=None):
         "tgt_joints": {k: v.tolist() for k, v in conversions.posed_joints(tgt_arm).items()},
         "pose": {k: v.tolist() for k, v in pose.items()},
         "src_feet": {k: [np.asarray(x).tolist() for x in v] for k, v in src_feet.items()},
+        # Where the armatures stood: the conversion is saved relative to them.
+        "src_matrix": [list(r) for r in src_arm.matrix_world],
+        "tgt_matrix": [list(r) for r in tgt_arm.matrix_world],
+        "src_keys": shape_key_values(src_body), "tgt_keys": shape_key_values(tgt_body),
     }
     cal = s.calibration
     cal["ah_conversion"] = json.dumps(meta)
@@ -96,6 +108,8 @@ def save_conversion(s, cal):
     fitted = mu.transform_points(cal.matrix_world, mu.read_shape_key(keys.key_blocks[CALIBRATION_KEY], n))
     _co, tris, _edges = mu.mesh_arrays(cal.data)
     conv = conversions.Conversion.from_meta(meta, base, fitted, tris)
+    if "src_matrix" in meta:
+        conv.to_armature_frame(np.array(meta["src_matrix"]), np.array(meta["tgt_matrix"]))
     stem = conversions.file_stem(conv.name)
     conv.save(conversions.path_for(stem))
     s.conversion = stem

@@ -21,8 +21,18 @@ SOLVERS = (
 )
 
 
+def is_result(obj):
+    """Made by the add-on: a fitted or finalized copy, or the calibration preview."""
+    return any(k in obj for k in ("ah_fitted_from", "ah_final_from", "ah_calibration"))
+
+
+def _is_clothing(_self, obj):
+    s = bpy.context.scene.avatar_helper
+    return obj.type == 'MESH' and not is_result(obj) and obj not in (s.source_body, s.target_body)
+
+
 class AH_ClothingItem(bpy.types.PropertyGroup):
-    obj: PointerProperty(name="Object", type=bpy.types.Object, poll=_is_mesh)
+    obj: PointerProperty(name="Object", type=bpy.types.Object, poll=_is_clothing)
     mode: EnumProperty(
         name="Mode",
         items=(
@@ -132,6 +142,19 @@ class AH_Settings(bpy.types.PropertyGroup):
         name="Replace Previous Results", default=True,
         description="Delete earlier fitted copies of the same clothing before fitting")
     hide_originals: BoolProperty(name="Hide Originals", default=True)
+    rig_to: EnumProperty(
+        name="Rig To",
+        items=(
+            ('OUTFIT', "Outfit Armature",
+             "Keep the fitted copy of the outfit's armature, to merge onto the avatar in Unity "
+             "(e.g. with Modular Avatar Merge Armature)"),
+            ('AVATAR', "Avatar Armature",
+             "Rig the clothing to the avatar's own armature: near the body it takes the body's skin weights so "
+             "it bends with the skin without clipping; the outfit's own bones (e.g. for physics) are added "
+             "to the avatar's armature"),
+        ),
+        default='OUTFIT',
+        description="What the finalized clothing is rigged to")
 
 
 class AH_Preferences(bpy.types.AddonPreferences):

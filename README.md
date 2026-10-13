@@ -38,19 +38,45 @@ Conversions are saved in `Documents/AvatarHelper/Conversions` (change it in the 
 folder button next to the conversion opens it, for sharing, backing up or deleting conversions. The base
 avatar can be deleted afterwards.
 
+A conversion is saved relative to the two armatures, as if both avatars stood at the origin, so it doesn't
+matter where the base or your avatar stood while creating it, or where an outfit stands when fitting.
+(Conversions made before this was added still work as before; create them again to get this.) It also
+records the shape key values of both bodies (e.g. the base's `Foot_heel`): see *Shape keys* below.
+
 ### Every outfit: fit clothing
 
 1. Import the outfit (it can come with a partial armature: only the bones it uses). Choose the conversion for
    its base, and set your avatar's body.
-2. Add the outfit meshes and press *Auto-Sort Layers* (orders them innermost-first from how they overlap,
+2. Add the outfit meshes (fitted and finalized results can't be added) and press *Auto-Sort Layers* (orders them innermost-first from how they overlap,
    keeping your order where that doesn't tell, and removes duplicates). Each item has a mode: *Auto* (shoes if
    skinned almost entirely below the knee and mostly to the feet), *Fit*, or *Shoes*, a solver, and
    optionally its own Shape Detail (see below); the box under the list shows the selected item's settings,
    and anything not set per item uses the defaults below it.
 3. **Fit Clothing**. The outfit's armature is posed like the base was for the conversion, and put back
-   afterwards; there's no armature to pick. Results go to the `AH_Fitted` collection: fitted meshes plus a
-   fitted copy of each outfit armature (rest pose in your avatar's proportions), ready for Modular Avatar
-   *Merge Armature* in Unity. Fit warns if the list order contradicts how the items overlap.
+   afterwards; there's no armature to pick. Results go to the `AH_Fitted` collection as `<name>_fitted`:
+   fitted meshes plus a fitted copy of each outfit armature (rest pose in your avatar's proportions). Fitting
+   again replaces them. Fit warns if the list order contradicts how the items overlap.
+4. **Finalize** when you're happy with it. The fitted clothing takes the originals' names and their place in
+   your collections (Unity animations and toggles go by name); the originals are renamed `<name> (original)`
+   and moved to a hidden `AH_Originals` collection, still there to fit again. Finalized clothing is never
+   replaced by later fits, and the list is cleared for the next outfit, or the next part of this one (parts
+   finalized later share the outfit armature finalized first). *Rig To* chooses what it's rigged to:
+   - *Outfit Armature*: the fitted copy of the outfit's armature, to merge onto your avatar in Unity (e.g.
+     Modular Avatar *Merge Armature*).
+   - *Avatar Armature*: your avatar's own armature. Clothing near the body takes the body's own skin weights at
+     the nearest point of the skin, so in any pose it bends exactly like the skin under it, which keeps
+     clipping to a minimum (in tests about the same or less than the outfit armature, and much less for tight
+     clothing). Loose parts keep the outfit's weights on your avatar's matching bones, and the outfit's own
+     bones (skirt or string bones for physics) are added to your avatar's armature under the matching bone.
+     At most 4 bones per vertex, as Unity uses. Your avatar's armature must be in its rest pose.
+
+### Shape keys
+
+A conversion only fits clothing shaped for the base as it was when the conversion was made. So when fitting,
+clothing shape keys with the same name as one of the base body's (ignoring case, spaces and underscores; e.g.
+`Foot_heel`) are set to the value the base had, and the fitted copy keeps that value; the original is left as
+it was. Fit lists any keys it changed, and warns if your avatar's own shape keys changed since the conversion
+was made (create it again then).
 
 ### Touching up
 

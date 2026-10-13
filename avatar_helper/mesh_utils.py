@@ -214,10 +214,13 @@ def similarity_fit(src, dst):
     return scale * (src - src.mean(0)) @ rot.T + dst.mean(0)
 
 
-def voxel_downsample(points, values, size, max_points):
-    """Average points and their values into a voxel grid, growing the voxels until under max_points."""
+def voxel_downsample(points, values, size, max_points, grid_points=None):
+    """Average points and their values into a voxel grid, growing the voxels until under max_points.
+    grid_points: the same points in another frame to lay the grid out in (so the result doesn't
+    depend on where the points happen to be), with `size` in that frame's units."""
+    grid_points = points if grid_points is None else grid_points
     while True:
-        keys = np.floor(points / size).astype(np.int64)
+        keys = np.floor(grid_points / size).astype(np.int64)
         _, inv, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
         if len(counts) <= max_points:
             break

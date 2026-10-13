@@ -9,7 +9,13 @@ A conversion holds everything fitting needs from the source side:
     the same way, even one with only some of the bones;
   * the rest positions of both rigs' humanoid joints, used to line the conversion up with
     whatever armature the clothing uses and the target avatar in the current scene;
-  * the source feet (for placing shoes).
+  * the source feet (for placing shoes);
+  * the shape key values of both bodies when it was made (e.g. "Foot_heel"), so clothing
+    can be fitted with matching keys.
+
+Since version 2 everything is stored relative to the armatures (the source side to the base's
+armature, the target side to the avatar's), as if calibrated at the origin: where either
+avatar stood in the scene doesn't matter.
 """
 import json
 import os
@@ -22,7 +28,7 @@ from mathutils import Matrix
 from . import mesh_utils as mu
 from . import rig
 
-VERSION = 1
+VERSION = 2
 EXTENSION = ".ahconv"
 LIBRARY_OVERRIDE = None  # tests point this at a temporary folder
 
@@ -80,27 +86,52 @@ def path_for(stem):
 
 class Conversion:
     def __init__(self, name, base, fitted, tris, src_joints, tgt_joints, pose, src_feet,
-                 source="", target=""):
+                 source="", target="", frame="world", src_keys=None, tgt_keys=None):
         self.name = name
-        self.base = np.asarray(base, dtype=np.float64)  # pose-matched source body, world at calibration
+        # "world": as in the scene at calibration (version 1 files); "armature": the source side
+        # relative to the base's armature, the target side relative to the avatar's.
+        self.frame = frame
+        self.base = np.asarray(base, dtype=np.float64)  # pose-matched source body
         self.fitted = np.asarray(fitted, dtype=np.float64)  # the same points on the target body
         self.tris = np.asarray(tris, dtype=np.int64)
         self.src_joints = {k: np.asarray(v, dtype=np.float64) for k, v in src_joints.items()}  # rest
         self.tgt_joints = {k: np.asarray(v, dtype=np.float64) for k, v in tgt_joints.items()}
-        self.pose = {k: np.asarray(v, dtype=np.float64) for k, v in pose.items()}  # world 4x4 deltas
+        self.pose = {k: np.asarray(v, dtype=np.float64) for k, v in pose.items()}  # 4x4 deltas
+        # Per side: ankle, toe tip, a point on the floor below the ankle, foot width. Version 1
+        # files store the floor as a height.
         self.src_feet = {k: tuple(np.asarray(x, dtype=np.float64) for x in v) for k, v in src_feet.items()}
         self.source = source
         self.target = target
+        self.src_keys = dict(src_keys or {})  # shape key values of the source body
+        self.tgt_keys = dict(tgt_keys or {})  # and of the target body
+
+    def to_armature_frame(self, src_matrix, tgt_matrix):
+        """Re-express a conversion made in world space relative to the two armatures (their
+        world matrices at calibration)."""
+        s_inv = np.linalg.inv(src_matrix)
+        t_inv = np.linalg.inv(tgt_matrix)
+        self.base = mu.transform_points(s_inv, self.base)
+        self.fitted = mu.transform_points(t_inv, self.fitted)
+        self.src_joints = {k: _apply(s_inv, v) for k, v in self.src_joints.items()}
+        self.tgt_joints = {k: _apply(t_inv, v) for k, v in self.tgt_joints.items()}
+        self.pose = {k: s_inv @ v @ src_matrix for k, v in self.pose.items()}
+        scale = np.cbrt(abs(np.linalg.det(s_inv[:3, :3])))
+        self.src_feet = {side: (_apply(s_inv, ankle), _apply(s_inv, tip),
+                                _apply(s_inv, _floor_point(ankle, floor)), np.asarray(width * scale))
+                         for side, (ankle, tip, floor, width) in self.src_feet.items()}
+        self.frame = "armature"
 
     # ---------------------------------------------------------------- files
 
     def meta(self):
         return {
             "version": VERSION, "name": self.name, "source": self.source, "target": self.target,
+            "frame": self.frame,
             "src_joints": {k: v.tolist() for k, v in self.src_joints.items()},
             "tgt_joints": {k: v.tolist() for k, v in self.tgt_joints.items()},
             "pose": {k: v.tolist() for k, v in self.pose.items()},
             "src_feet": {k: [np.asarray(x).tolist() for x in v] for k, v in self.src_feet.items()},
+            "src_keys": self.src_keys, "tgt_keys": self.tgt_keys,
         }
 
     def save(self, path):
@@ -117,24 +148,34 @@ class Conversion:
     @classmethod
     def from_meta(cls, meta, base, fitted, tris):
         return cls(meta["name"], base, fitted, tris, meta["src_joints"], meta["tgt_joints"], meta["pose"],
-                   meta["src_feet"], meta.get("source", ""), meta.get("target", ""))
+                   meta["src_feet"], meta.get("source", ""), meta.get("target", ""), meta.get("frame", "world"),
+                   meta.get("src_keys"), meta.get("tgt_keys"))
 
     # ---------------------------------------------------------------- placement
 
     def source_alignment(self, arm):
         """4x4 matrix carrying the conversion's source space onto clothing armature `arm`
-        (matching their humanoid joints at rest), or identity if they can't be matched."""
+        (matching their humanoid joints at rest). An armature that can't be matched is taken
+        to be the base's own armature, wherever it is."""
         mapping = rig.armature_map(arm)
         keys = [k for k in mapping if k in self.src_joints]
-        here = [np.array((arm.matrix_world @ arm.data.bones[mapping[k]].head_local)[:]) for k in keys]
-        return _align([self.src_joints[k] for k in keys], here)
+        if self.frame == "world":
+            here = [np.array((arm.matrix_world @ arm.data.bones[mapping[k]].head_local)[:]) for k in keys]
+            return _align([self.src_joints[k] for k in keys], here)
+        here = [np.array(arm.data.bones[mapping[k]].head_local[:]) for k in keys]
+        mw = np.array(arm.matrix_world)
+        return mw @ _align_local([self.src_joints[k] for k in keys], here, _scale(mw))
 
     def target_alignment(self, arm):
         """4x4 matrix carrying the conversion's target space onto the target armature as posed now."""
         mapping = rig.armature_map(arm)
         keys = [k for k in mapping if k in self.tgt_joints]
-        here = [np.array(rig.posed_head(arm, mapping[k])[:]) for k in keys]
-        return _align([self.tgt_joints[k] for k in keys], here)
+        posed = [np.array(rig.posed_head(arm, mapping[k])[:]) for k in keys]
+        if self.frame == "world":
+            return _align([self.tgt_joints[k] for k in keys], posed)
+        mw = np.array(arm.matrix_world)
+        here = [_apply(np.linalg.inv(mw), p) for p in posed]
+        return mw @ _align_local([self.tgt_joints[k] for k in keys], here, _scale(mw))
 
     def apply_pose(self, context, arm, align):
         """Pose a clothing armature the way the source rig was posed to match the target.
@@ -158,29 +199,57 @@ class Conversion:
         out = {}
         for side, (ankle, tip, floor, width) in self.src_feet.items():
             a, t = _apply(align, ankle), _apply(align, tip)
-            fl = _apply(align, np.array([ankle[0], ankle[1], floor]))[2]
+            fl = _apply(align, _floor_point(ankle, floor))[2]
             out[side] = (a, t, float(fl), float(width) * scale)
         return out
+
+
+def _floor_point(ankle, floor):
+    """A point on the floor below the ankle (version 1 files store the floor as a height)."""
+    floor = np.asarray(floor, dtype=np.float64)
+    return floor if floor.ndim else np.array([ankle[0], ankle[1], float(floor)])
 
 
 def _apply(m, p):
     return m[:3, :3] @ np.asarray(p) + m[:3, 3]
 
 
+ALIGN_EXACT = 0.002  # metres; an armature whose joints all lie this close is taken as is
+
+
+def _scale(m):
+    return float(np.cbrt(abs(np.linalg.det(np.asarray(m)[:3, :3]))))
+
+
+def _align_local(src, dst, unit=1.0):
+    """Like _align, but between armature spaces (`unit`: world size of one armature unit): a
+    clothing armature built on the base's has the same joints, so it's taken as is rather
+    than fitted (which would add small errors, or worse with few joints). Only an armature
+    that clearly differs is fitted."""
+    if not len(src):
+        return np.eye(4)
+    src, dst = np.array(src), np.array(dst)
+    resid = np.linalg.norm(src - dst, axis=1) * unit
+    if np.percentile(resid, 90) <= ALIGN_EXACT:
+        return np.eye(4)
+    return _align(src, dst, unit)
+
+
 ALIGN_OUTLIER = 0.01  # metres; joints further off than this after alignment are left out
 
 
-def _align(src, dst):
+def _align(src, dst, unit=1.0):
     """Similarity transform (4x4) taking points src onto dst. Joints that don't agree with the
-    rest (a mis-named bone, one moved by the outfit's creator) are dropped and the fit redone."""
-    if not src:
+    rest (a mis-named bone, one moved by the outfit's creator) are dropped and the fit redone.
+    `unit`: world size of one unit of the points."""
+    if not len(src):
         return np.eye(4)
     src, dst = np.array(src), np.array(dst)
     keep = np.ones(len(src), dtype=bool)
     for _ in range(3):
         m = _similarity(src[keep], dst[keep])
         resid = np.linalg.norm(src @ m[:3, :3].T + m[:3, 3] - dst, axis=1)
-        new = resid <= max(ALIGN_OUTLIER, 3.0 * np.median(resid))
+        new = resid <= max(ALIGN_OUTLIER / unit, 3.0 * np.median(resid))
         if new.sum() < 3 or (new == keep).all():
             break
         keep = new

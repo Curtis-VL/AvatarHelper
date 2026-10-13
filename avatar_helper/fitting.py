@@ -13,6 +13,7 @@ Clothing is never projected onto the body. Instead:
 """
 import math
 import os
+import re
 
 import bpy
 import numpy as np
@@ -21,7 +22,8 @@ from mathutils.kdtree import KDTree
 
 from . import mesh_utils as mu
 from . import conversions, elastic, rig
-from .calibration import CALIBRATION_KEY, output_collection, target_armature
+from .calibration import CALIBRATION_KEY, output_collection, shape_key_values, target_armature
+from .props import is_result
 from .rbf import RBFWarp
 from .rig import armature_map, bone_depth, deforming_armatures
 
@@ -82,17 +84,19 @@ class SurfaceBinding:
 class FitField(SurfaceBinding):
     """The calibration as a deformation: a smooth space warp plus binding to the body surface."""
 
-    def __init__(self, base, fitted, tris, resolution, smoothing, max_centers=2500):
+    def __init__(self, base, fitted, tris, resolution, smoothing, max_centers=2500, grid=None, grid_unit=1.0):
         super().__init__(base, fitted, tris)
-        centers, values = mu.voxel_downsample(base, fitted - base, resolution, max_centers)
+        centers, values = mu.voxel_downsample(base, fitted - base, resolution / grid_unit, max_centers, grid)
         self.rbf = RBFWarp(centers, values, smoothing)
 
     @classmethod
     def from_conversion(cls, conv, src_align, tgt_align, resolution, smoothing):
         """The conversion placed in this scene: its source side on the clothing's armature,
-        its target side on the target avatar."""
+        its target side on the target avatar. The warp is sampled in the conversion's own
+        frame, so where the clothing stands doesn't change it."""
+        unit = float(np.cbrt(abs(np.linalg.det(src_align[:3, :3]))))
         return cls(mu.transform_points(src_align, conv.base), mu.transform_points(tgt_align, conv.fitted),
-                   conv.tris, resolution, smoothing)
+                   conv.tris, resolution, smoothing, grid=conv.base, grid_unit=unit)
 
     @classmethod
     def from_object(cls, cal_obj, resolution, smoothing):
@@ -248,14 +252,16 @@ LAYER_RANGE = 0.03  # how far apart two layers can be and still count as touchin
 BODY_MATCH = 0.003  # a part of the avatar mesh is body if most of it lies within this of the calibrated body
 
 
-def body_parts(verts, edges, field):
+def body_parts(verts, edges, calibrated):
     """Vertices of the avatar mesh belonging to its body: the connected parts lying mostly
-    on the calibrated body. Hair strands, accessories and clothing merged into the mesh lie
-    off it."""
+    on the calibrated body (`calibrated`: a BVH of it). Hair strands, accessories and
+    clothing merged into the mesh lie off it."""
     labels = mu.islands(len(verts), edges)
-    _loc, _nrm, idx, _dist = mu.nearest_on(field.bvh_fitted, verts, BODY_MATCH)
+    _loc, _nrm, idx, _dist = mu.nearest_on(calibrated, verts, BODY_MATCH)
     on = np.bincount(labels, weights=(idx >= 0).astype(float)) / np.bincount(labels)
     return on[labels] > 0.5
+
+
 BODY_DEPTH = 0.03  # how deep inside the body a point can be and still be pushed out
 # Clothing is thin and open: a point more than this "inside" another item has gone through
 # to its other side (or was never outside it), so it isn't pushed back.
@@ -881,7 +887,33 @@ def _share_outside(shell_points, shell_tris, points, normals, room=0.0):
     return out.mean()
 
 
-def fit_clothing(context, s, progress=None):
+def _key_name(name):
+    return re.sub(r"[^a-z0-9]", "", name.lower())
+
+
+def match_shape_keys(objs, values):
+    """Set the clothing's shape keys named like the base body's (e.g. "Foot_heel") to the
+    values the base had when the conversion was made: the conversion only fits clothing
+    shaped for the base as it was then. Returns (key, old value) pairs to restore later, and
+    a description of what changed."""
+    wanted = {_key_name(k): v for k, v in values.items()}
+    saved, changes = [], []
+    for o in objs:
+        keys = o.data.shape_keys
+        if keys is None:
+            continue
+        for kb in keys.key_blocks:
+            v = wanted.get(_key_name(kb.name)) if kb != keys.reference_key else None
+            if v is not None and abs(kb.value - v) > 1e-4:
+                saved.append((kb, kb.value))
+                changes.append(f"{o.name} '{kb.name}' {kb.value:g} → {v:g}")
+                kb.value = v
+    return saved, changes
+
+
+def fit_clothing(context, s, progress=None, notes=None):
+    """notes: optional list collecting things worth telling the user."""
+    notes = [] if notes is None else notes
     if not s.conversion:
         raise ValueError("Choose a conversion (or create one) first")
     path = conversions.path_for(s.conversion)
@@ -895,7 +927,7 @@ def fit_clothing(context, s, progress=None):
     objs, shoes, solvers = [], set(), {}
     for item in s.clothing:
         o = item.obj
-        if o and o.type == 'MESH' and o not in objs and not o.get("ah_fitted_from"):
+        if o and o.type == 'MESH' and o not in objs and not is_result(o):
             objs.append(o)
             solvers[o] = (s.solver if item.solver == 'DEFAULT' else item.solver,
                           item.shape_detail if item.custom_detail else s.shape_detail)
@@ -927,9 +959,20 @@ def fit_clothing(context, s, progress=None):
         obj_arms = deforming_armatures(o)
         return src_align[obj_arms[0]] if obj_arms else default_align
 
-    # Pose the clothing armatures the way the source rig was posed for the conversion; their
-    # own pose is restored afterwards.
+    tgt_now = shape_key_values(s.target_body)
+    changed = sorted(k for k, v in conv.tgt_keys.items() if k in tgt_now and abs(tgt_now[k] - v) > 1e-3)
+    if changed:
+        notes.append(f"Your avatar's shape keys changed since the conversion was made ({', '.join(changed[:4])}); "
+                     "create it again so the fit uses its current shape")
+
+    # Pose the clothing armatures the way the source rig was posed for the conversion, and set
+    # their shape keys as the base had them; both are restored afterwards (the fitted copies
+    # keep the matched key values, as that's what they were fitted with).
     saved_pose = [(pb, pb.matrix_basis.copy()) for a in arms for pb in a.pose.bones]
+    saved_keys, key_changes = match_shape_keys(objs, conv.src_keys)
+    if key_changes:
+        notes.append("Shape keys set to match the base: " + "; ".join(key_changes[:5])
+                     + (f" (+{len(key_changes) - 5} more)" if len(key_changes) > 5 else ""))
     try:
         for a in arms:
             conv.apply_pose(context, a, src_align[a])
@@ -955,6 +998,8 @@ def fit_clothing(context, s, progress=None):
     finally:
         for pb, m in saved_pose:
             pb.matrix_basis = m
+        for kb, v in saved_keys:
+            kb.value = v
         context.view_layer.update()
 
 
@@ -966,7 +1011,7 @@ def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_fee
     # parts the conversion matched (body, head) are collided with; clothing would otherwise
     # be pushed out of every hair strand or merged-in choker, e.g. a hood lying in long hair.
     # Decided per connected part, so a strand or choker touching the skin is still left out.
-    skin = body_parts(body_verts, te, field_for(align_of(objs[0])))
+    skin = body_parts(body_verts, te, field_for(align_of(objs[0])).bvh_fitted)
     tt = tt[skin[tt].all(1)]
     body_bvh = mu.build_bvh(body_verts, tt)
     body = (body_verts[skin], body_normals[skin], body_bvh)

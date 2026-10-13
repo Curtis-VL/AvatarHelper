@@ -2,8 +2,9 @@ import bmesh
 import bpy
 import numpy as np
 
-from . import calibration, conversions, fitting, layers, rig, touchup
+from . import calibration, conversions, finalize, fitting, layers, rig, touchup
 from .bone_map import missing_required
+from .props import is_result
 
 HIGH_ERROR = 0.003  # metres; a good calibration is well under 1 mm on average
 
@@ -187,6 +188,29 @@ class AH_OT_clear_landmarks(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AH_OT_finalize(bpy.types.Operator):
+    bl_idname = "avatar_helper.finalize"
+    bl_label = "Finalize"
+    bl_description = ("Keep the fitted clothing in the list: it takes the originals' names and place (they're "
+                      "renamed '(original)' and hidden), later fits won't replace it, and the list is cleared for "
+                      "the next outfit or part")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.avatar_helper
+        _ensure_object_mode(context)
+        try:
+            done, added = finalize.finalize(context, s, s.rig_to)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        msg = "Finalized " + ", ".join(done)
+        if added:
+            msg += f"; added {len(added)} outfit bone(s) to the avatar's armature"
+        self.report({'INFO'}, msg)
+        return {'FINISHED'}
+
+
 class AH_OT_restore_shape(bpy.types.Operator):
     bl_idname = "avatar_helper.restore_shape"
     bl_label = "Restore Original Shape"
@@ -209,7 +233,7 @@ class AH_OT_restore_shape(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         o = context.edit_object
-        return o is not None and o.type == 'MESH' and o.get("ah_fitted_from") is not None
+        return o is not None and o.type == 'MESH' and ("ah_fitted_from" in o or "ah_final_from" in o)
 
     def execute(self, context):
         obj = context.edit_object
@@ -239,7 +263,7 @@ class AH_OT_restore_shape(bpy.types.Operator):
 def _unique_clothing(s):
     objs = []
     for it in s.clothing:
-        if it.obj and it.obj not in objs and not it.obj.get("ah_fitted_from"):
+        if it.obj and it.obj not in objs and not is_result(it.obj):
             objs.append(it.obj)
     return objs
 
@@ -297,9 +321,10 @@ class AH_OT_fit(bpy.types.Operator):
                 warnings.append("order differs from the source (" +
                                 ", ".join(f"'{a}' is under '{b}'" for a, b in wrong[:3]) +
                                 "); use Auto-Sort Layers")
+        notes = []
         try:
             with _Progress(context) as progress:
-                meshes, arms, shoes = fitting.fit_clothing(context, s, progress)
+                meshes, arms, shoes = fitting.fit_clothing(context, s, progress, notes)
         except ValueError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
@@ -309,6 +334,8 @@ class AH_OT_fit(bpy.types.Operator):
         self.report({'INFO'}, msg)
         for w in warnings:
             self.report({'WARNING'}, "Layers " + w)
+        for n in notes:
+            self.report({'WARNING'}, n)
         return {'FINISHED'}
 
 
@@ -324,7 +351,7 @@ class AH_OT_clothing_add(bpy.types.Operator):
         skip = {s.source_body, s.target_body, s.calibration}
         added = 0
         for o in context.selected_objects:
-            if o.type == 'MESH' and o not in present and o not in skip and not o.get("ah_fitted_from"):
+            if o.type == 'MESH' and o not in present and o not in skip and not is_result(o):
                 s.clothing.add().obj = o
                 added += 1
         if not added:
@@ -373,6 +400,7 @@ classes = (
     AH_OT_clear_landmarks,
     AH_OT_sort_layers,
     AH_OT_fit,
+    AH_OT_finalize,
     AH_OT_restore_shape,
     AH_OT_clothing_add,
     AH_OT_clothing_remove,
