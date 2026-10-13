@@ -52,9 +52,6 @@ class AH_PT_main(_Panel, bpy.types.Panel):
     bl_idname = "AH_PT_main"
     bl_label = "AvatarHelper"
 
-    def draw_header_preset(self, _context):
-        self.layout.operator("avatar_helper.report_bug", text="", icon='HELP', emboss=False)
-
     def draw(self, context):
         s = context.scene.avatar_helper
         layout = self.layout
@@ -191,6 +188,16 @@ class AH_PT_touchup(_Panel, bpy.types.Panel):
         layout.operator("avatar_helper.restore_shape", icon='MOD_SMOOTH')
 
 
+class AH_PT_help(_Panel, bpy.types.Panel):
+    """Last in the sidebar, below Touch Up."""
+    bl_label = "Help"
+    bl_parent_id = "AH_PT_main"
+    bl_options = {'HIDE_HEADER'}
+
+    def draw(self, _context):
+        self.layout.operator("avatar_helper.report_bug", icon='HELP')
+
+
 class AH_PT_fit_advanced(_Panel, bpy.types.Panel):
     bl_label = "Advanced"
     bl_parent_id = "AH_PT_fit"
@@ -219,7 +226,7 @@ class AH_PT_fit_advanced(_Panel, bpy.types.Panel):
 
 
 classes = (AH_UL_clothing, AH_PT_main, AH_PT_create, AH_PT_create_advanced, AH_PT_fit, AH_PT_fit_advanced,
-           AH_PT_touchup)
+           AH_PT_touchup, AH_PT_help)
 
 
 def register():
