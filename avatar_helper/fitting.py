@@ -110,6 +110,13 @@ class FitField(SurfaceBinding):
     def warp(self, pts):
         return pts + self.rbf(pts)
 
+    @property
+    def bvh_fitted(self):
+        """The calibrated body in the target's shape."""
+        if not hasattr(self, "_bvh_fitted"):
+            self._bvh_fitted = mu.build_bvh(self.fitted, self.tris)
+        return self._bvh_fitted
+
     def nearest_vertex(self, pts):
         """Index of the nearest calibrated (target-shaped) source body vertex for each point."""
         if not hasattr(self, "_kd"):
@@ -238,6 +245,17 @@ def poke_through(points, tris, body_verts, body_normals, gaps):
 
 
 LAYER_RANGE = 0.03  # how far apart two layers can be and still count as touching
+BODY_MATCH = 0.003  # a part of the avatar mesh is body if most of it lies within this of the calibrated body
+
+
+def body_parts(verts, edges, field):
+    """Vertices of the avatar mesh belonging to its body: the connected parts lying mostly
+    on the calibrated body. Hair strands, accessories and clothing merged into the mesh lie
+    off it."""
+    labels = mu.islands(len(verts), edges)
+    _loc, _nrm, idx, _dist = mu.nearest_on(field.bvh_fitted, verts, BODY_MATCH)
+    on = np.bincount(labels, weights=(idx >= 0).astype(float)) / np.bincount(labels)
+    return on[labels] > 0.5
 BODY_DEPTH = 0.03  # how deep inside the body a point can be and still be pushed out
 # Clothing is thin and open: a point more than this "inside" another item has gone through
 # to its other side (or was never outside it), so it isn't pushed back.
@@ -942,9 +960,16 @@ def fit_clothing(context, s, progress=None):
 
 def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_feet,
                 field_for, align_of, arms, arm_map, coll, progress):
-    body_verts, tt, _ = mu.evaluated_mesh_world(s.target_body, context.evaluated_depsgraph_get())
+    body_verts, tt, te = mu.evaluated_mesh_world(s.target_body, context.evaluated_depsgraph_get())
+    body_normals = mu.vertex_normals(body_verts, tt)
+    # Avatars often have hair, accessories or clothing merged into the body mesh. Only the
+    # parts the conversion matched (body, head) are collided with; clothing would otherwise
+    # be pushed out of every hair strand or merged-in choker, e.g. a hood lying in long hair.
+    # Decided per connected part, so a strand or choker touching the skin is still left out.
+    skin = body_parts(body_verts, te, field_for(align_of(objs[0])))
+    tt = tt[skin[tt].all(1)]
     body_bvh = mu.build_bvh(body_verts, tt)
-    body = (body_verts, mu.vertex_normals(body_verts, tt), body_bvh)
+    body = (body_verts[skin], body_normals[skin], body_bvh)
 
     # Shoes are placed first, sized to cover the target's feet. Layers listed before a shoe
     # (socks, stockings) are then tucked inside it rather than the shoe growing around them.

@@ -52,6 +52,22 @@ avatar can be deleted afterwards.
    fitted copy of each outfit armature (rest pose in your avatar's proportions), ready for Modular Avatar
    *Merge Armature* in Unity. Fit warns if the list order contradicts how the items overlap.
 
+### Touching up
+
+Bumps on a fitted garment are most visible along its edges (a hem, a cuff, a hood's rim). To fix one,
+select the fitted mesh, enter Edit Mode, select the bumpy part (generously, e.g. the whole hem band) and
+press **Touch Up → Restore Original Shape**. The selection is rebuilt from the original garment's shape:
+only how it was stretched and turned on a larger scale is kept from the fit, while the rest of the garment
+stays put and holds it in place. In the redo panel:
+
+- *Shape Size* (5 cm): the selection keeps the original's shape up to this size. Raise it if bumps remain,
+  lower it if the part stops following the body.
+- *Falloff* (1 cm): blends into the unselected part, so there's no seam.
+- *Keep Outside Body*: points that were outside the avatar's body stay outside it (by up to Min Gap). Parts
+  tucked inside the body by design are left as fitted.
+
+It works on whichever shape key you're editing, comparing with the original's same key (e.g. a "crop" key).
+
 ### Controls that matter most
 
 | Setting | Effect |
@@ -127,6 +143,9 @@ In *Advanced* (under Fit Clothing):
   pieces lying on it, so they move out together and keep their gap instead of the inner piece coming through.
   Elsewhere each piece keeps its own shape. Which piece is over which is read from the source; a few points
   the other way round (at a folded edge) are ignored.
+- **What counts as body**: avatars often have hair, accessories or clothing merged into the body mesh. Only
+  the connected parts of the avatar mesh lying mostly on the calibrated body (body, head) are collided with;
+  everything else is ignored, so a hood lying in long hair isn't pushed out of every strand.
 - **Collision** only pushes outward: clothing vertices out of the body and lower layers, and clothing faces that
   body detail pokes through between vertices. Inner shells of thick clothing are left alone. Each push also moves
   what lies within 6 mm along the push direction, so the two sides of a strap or shell move together instead of

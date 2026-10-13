@@ -165,6 +165,23 @@ class AH_PT_fit(_Panel, bpy.types.Panel):
         layout.operator("avatar_helper.fit", icon='MOD_CLOTH')
 
 
+class AH_PT_touchup(_Panel, bpy.types.Panel):
+    bl_label = "Touch Up"
+    bl_parent_id = "AH_PT_main"
+
+    def draw(self, context):
+        layout = self.layout
+        o = context.edit_object or context.object
+        if not (o and o.get("ah_fitted_from")):
+            layout.label(text="Select a fitted mesh, then Edit Mode", icon='INFO')
+            return
+        if context.mode != 'EDIT_MESH':
+            layout.label(text="Enter Edit Mode and select bumpy parts", icon='INFO')
+            return
+        layout.label(text="Select the bumpy part (e.g. a hem):", icon='INFO')
+        layout.operator("avatar_helper.restore_shape", icon='MOD_SMOOTH')
+
+
 class AH_PT_fit_advanced(_Panel, bpy.types.Panel):
     bl_label = "Advanced"
     bl_parent_id = "AH_PT_fit"
@@ -192,7 +209,8 @@ class AH_PT_fit_advanced(_Panel, bpy.types.Panel):
         col.prop(s, "hide_originals")
 
 
-classes = (AH_UL_clothing, AH_PT_main, AH_PT_create, AH_PT_create_advanced, AH_PT_fit, AH_PT_fit_advanced)
+classes = (AH_UL_clothing, AH_PT_main, AH_PT_create, AH_PT_create_advanced, AH_PT_fit, AH_PT_fit_advanced,
+           AH_PT_touchup)
 
 
 def register():

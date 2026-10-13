@@ -17,6 +17,7 @@ RIGID_WEIGHT = 100.0  # edge weight inside rigid parts: practically unbendable
 LINK_WEIGHT = 10.0  # weight of links across a thin part or between interlocked pieces
 CONSTRAINT_WEIGHT = 10.0  # pull of a collision constraint, relative to an edge
 LINK_GAP = 0.002  # separate pieces closer than this are linked (a ring and its strap loop)
+THICKNESS_LINK = 0.006  # the two sides of a part closer than this are linked
 
 
 class _Graph:
@@ -102,6 +103,29 @@ def links(verts, tris, edges, thickness):
     return pairs
 
 
+STACK_REACH = 0.015  # restore_shape: separate pieces stacked closer than this move as one
+
+
+def stack_links(verts, tris, edges, reach=STACK_REACH):
+    """Pairs tying each point to the separate piece lying under it (a short ray inward hits
+    it, whichever way it faces): a band over a shirt, a knit over its inner top."""
+    labels = mu.islands(len(verts), edges)
+    if labels.max() == 0 or not len(tris):
+        return np.zeros((0, 2), dtype=np.int64)
+    tri_labels = labels[tris[:, 0]]
+    bvh = mu.build_bvh(verts, tris)
+    normals = mu.vertex_normals(verts, tris)
+    pairs = []
+    for i, (p, n) in enumerate(zip(verts.tolist(), normals.tolist())):
+        d = (-n[0], -n[1], -n[2])
+        loc, _nrm, idx, _dist = bvh.ray_cast((p[0] + d[0] * 1e-5, p[1] + d[1] * 1e-5, p[2] + d[2] * 1e-5), d, reach)
+        if idx is None or tri_labels[idx] == labels[i]:
+            continue
+        tri = tris[idx]
+        pairs.append((i, int(tri[np.argmin(np.linalg.norm(verts[tri] - np.array(loc[:]), axis=1))])))
+    return np.array(pairs, dtype=np.int64).reshape(-1, 2)
+
+
 def local_transforms(rest, targets, tris, e0, e1):
     """Per-vertex 3x3 map that best carries the rest edges around a vertex onto the
     suggested positions. The normal is included so the map is defined across the surface."""
@@ -123,6 +147,53 @@ def local_transforms(rest, targets, tris, e0, e1):
     c += nt[:, :, None] * nr[:, None, :]
     m += np.eye(3)[None] * (1e-6 * length ** 2)[:, None, None]
     return c @ np.linalg.inv(m)
+
+
+def restore_shape(rest, current, tris, edges, weight, scale, collision_push=None, iterations=3):
+    """Rebuild part of a fitted garment from its original shape.
+
+    rest: the original garment; current: the fitted one (same vertices). weight: 0..1 per
+    vertex, 1 where the shape is restored fully, 0 where the fitted position is kept (the
+    rest of the garment holds the restored part in place). scale: the garment keeps its own
+    shape below this size, and only how it was stretched and turned on a larger scale comes
+    from the fit; so bumps and wobble smaller than this go.
+    collision_push(x) -> per-vertex push needed at positions x (e.g. out of the body), or None.
+    Returns the new positions.
+    """
+    n = len(rest)
+    e0, e1 = edges[:, 0], edges[:, 1]
+    edge_len = float(np.median(np.linalg.norm(rest[e0] - rest[e1], axis=1))) if len(edges) else 0.005
+    a = local_transforms(rest, current, tris, e0, e1).reshape(n, 9)
+    # Smooth only within what's being restored (plus a margin), so a joint or fold outside it
+    # doesn't bleed in.
+    active = weight > 0.0
+    keep = np.isin(e0, np.nonzero(active)[0]) | np.isin(e1, np.nonzero(active)[0])
+    steps = int(min(400, round(2.0 * (scale / max(edge_len, 1e-5)) ** 2)))
+    a = mu.Adjacency(n, edges[keep]).smooth(a, steps).reshape(n, 3, 3)
+    # Separate pieces lying on or touching each other (a band over a shirt, both sides of a
+    # strap) are tied together, so they're restored as one rather than drifting apart.
+    link_pairs = np.concatenate([links(rest, tris, edges, THICKNESS_LINK), stack_links(rest, tris, edges)])
+    e0 = np.concatenate([e0, link_pairs[:, 0]])
+    e1 = np.concatenate([e1, link_pairs[:, 1]])
+    w = np.concatenate([np.ones(len(edges)), np.full(len(link_pairs), LINK_WEIGHT)])
+    d = 0.5 * np.einsum("nij,nj->ni", a[e0] + a[e1], rest[e1] - rest[e0])
+    graph = _Graph(n, e0, e1, w)
+    # Fixed where weight is 0, free where it's 1, with a smooth blend between.
+    free = (edge_len / max(scale, 1e-5)) ** 2
+    pull = np.exp(np.log(1e4) * (1.0 - weight) + np.log(free) * weight)
+    pull_to = current.copy()
+    x = graph.solve(d, pull, pull_to, current, iterations=2000)
+    for _ in range(iterations if collision_push is not None else 0):
+        push = collision_push(x)
+        hit = (np.linalg.norm(push, axis=1) > 1e-7) & active
+        if not hit.any():
+            break
+        pull = pull.copy()
+        pull[hit] = np.maximum(pull[hit], CONSTRAINT_WEIGHT)
+        pull_to = pull_to.copy()
+        pull_to[hit] = x[hit] + push[hit]
+        x = graph.solve(d, pull, pull_to, x, iterations=2000)
+    return x
 
 
 def solve_fit(verts, tris, edges, targets, rigid, rigid_maps, collision_push, detail, thickness, iterations):

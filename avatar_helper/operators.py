@@ -1,6 +1,8 @@
+import bmesh
 import bpy
+import numpy as np
 
-from . import calibration, conversions, fitting, layers, rig
+from . import calibration, conversions, fitting, layers, rig, touchup
 from .bone_map import missing_required
 
 HIGH_ERROR = 0.003  # metres; a good calibration is well under 1 mm on average
@@ -185,6 +187,55 @@ class AH_OT_clear_landmarks(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AH_OT_restore_shape(bpy.types.Operator):
+    bl_idname = "avatar_helper.restore_shape"
+    bl_label = "Restore Original Shape"
+    bl_description = ("Rebuild the selected part of a fitted garment from the original garment's shape, removing "
+                      "bumps and wobble (e.g. along a hem) while the rest of the garment stays put")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    scale: bpy.props.FloatProperty(
+        name="Shape Size", default=0.05, min=0.005, soft_max=0.3, subtype='DISTANCE', unit='LENGTH',
+        description="The selection keeps the original's shape up to this size; only larger stretching and "
+                    "turning comes from the fit. Raise it if bumps remain, lower it if the part no longer "
+                    "follows the body")
+    falloff: bpy.props.FloatProperty(
+        name="Falloff", default=0.01, min=0.0, soft_max=0.1, subtype='DISTANCE', unit='LENGTH',
+        description="Blend into the unselected part over this distance, so there's no visible seam")
+    keep_outside: bpy.props.BoolProperty(
+        name="Keep Outside Body", default=True,
+        description="Points that were outside the avatar's body (set in the panel) stay outside it")
+
+    @classmethod
+    def poll(cls, context):
+        o = context.edit_object
+        return o is not None and o.type == 'MESH' and o.get("ah_fitted_from") is not None
+
+    def execute(self, context):
+        obj = context.edit_object
+        bm = bmesh.from_edit_mesh(obj.data)
+        bm.verts.ensure_lookup_table()
+        coords = np.array([v.co[:] for v in bm.verts])
+        selected = np.array([v.select for v in bm.verts])
+        if not selected.any():
+            self.report({'ERROR'}, "Select the vertices to restore first")
+            return {'CANCELLED'}
+        tris = np.array([[l.vert.index for l in t] for t in bm.calc_loop_triangles()], dtype=np.int64).reshape(-1, 3)
+        edges = np.array([[e.verts[0].index, e.verts[1].index] for e in bm.edges], dtype=np.int64).reshape(-1, 2)
+        s = context.scene.avatar_helper
+        body = s.target_body if self.keep_outside else None
+        try:
+            new = touchup.restore_shape(context, obj, coords, selected, tris, edges, self.scale, self.falloff,
+                                        body, s.collision_offset)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        for v, co in zip(bm.verts, new.tolist()):
+            v.co = co
+        bmesh.update_edit_mesh(obj.data)
+        return {'FINISHED'}
+
+
 def _unique_clothing(s):
     objs = []
     for it in s.clothing:
@@ -322,6 +373,7 @@ classes = (
     AH_OT_clear_landmarks,
     AH_OT_sort_layers,
     AH_OT_fit,
+    AH_OT_restore_shape,
     AH_OT_clothing_add,
     AH_OT_clothing_remove,
     AH_OT_clothing_move,
