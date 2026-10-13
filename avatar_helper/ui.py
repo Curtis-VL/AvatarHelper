@@ -52,6 +52,9 @@ class AH_PT_main(_Panel, bpy.types.Panel):
     bl_idname = "AH_PT_main"
     bl_label = "AvatarHelper"
 
+    def draw_header_preset(self, _context):
+        self.layout.operator("avatar_helper.report_bug", text="", icon='HELP', emboss=False)
+
     def draw(self, context):
         s = context.scene.avatar_helper
         layout = self.layout

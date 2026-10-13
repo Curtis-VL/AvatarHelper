@@ -19,6 +19,7 @@ import bpy
 REPO = "Curtis-VL/AvatarHelper"
 LATEST_URL = f"https://api.github.com/repos/{REPO}/releases/latest"
 RELEASES_PAGE = f"https://github.com/{REPO}/releases"
+ISSUES_PAGE = f"https://github.com/{REPO}/issues"
 TIMEOUT = 15  # seconds
 
 # Shared with the background thread; only plain values, never Blender data.
@@ -38,6 +39,14 @@ def parse_version(tag):
     """'v0.1.23' -> (0, 1, 23)."""
     nums = re.findall(r"\d+", tag or "")
     return tuple(int(n) for n in nums[:3]) if nums else None
+
+
+def system_info():
+    """Versions worth including in a bug report."""
+    import platform
+    return (f"AvatarHelper {version_text(current_version())}{' (development copy)' if is_dev_install() else ''}\n"
+            f"Blender {bpy.app.version_string}\n"
+            f"{platform.system()} {platform.version()}")
 
 
 def is_dev_install():
@@ -168,3 +177,4 @@ def draw(layout, compact=False):
     sub.enabled = status == "available" and not is_dev_install()
     sub.operator("avatar_helper.update_install", icon='IMPORT')
     row.operator("wm.url_open", text="", icon='URL').url = state["page"]
+    col.operator("avatar_helper.report_bug", icon='HELP')

@@ -221,6 +221,19 @@ class AH_OT_update_install(bpy.types.Operator):
         return {'FINISHED'}
 
 
+class AH_OT_report_bug(bpy.types.Operator):
+    bl_idname = "avatar_helper.report_bug"
+    bl_label = "Report a Bug"
+    bl_description = ("Open AvatarHelper's issue page on GitHub, and copy your AvatarHelper, Blender and system "
+                      "versions to the clipboard to paste into the report")
+
+    def execute(self, context):
+        context.window_manager.clipboard = updater.system_info()
+        bpy.ops.wm.url_open(url=updater.ISSUES_PAGE)
+        self.report({'INFO'}, "Versions copied to the clipboard: paste them into your bug report")
+        return {'FINISHED'}
+
+
 class AH_OT_finalize(bpy.types.Operator):
     bl_idname = "avatar_helper.finalize"
     bl_label = "Finalize"
@@ -435,6 +448,7 @@ classes = (
     AH_OT_fit,
     AH_OT_update_check,
     AH_OT_update_install,
+    AH_OT_report_bug,
     AH_OT_finalize,
     AH_OT_restore_shape,
     AH_OT_clothing_add,

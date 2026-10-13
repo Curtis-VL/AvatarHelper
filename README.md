@@ -15,6 +15,12 @@ preferences). When there is one, the panel shows *Update available* with an **Up
 and installs it; restart Blender to finish. The add-on's preferences also have *Check for Updates* and a link to
 the release notes. A development copy (linked to a git checkout, below) isn't updated this way: use git.
 
+### Reporting bugs
+
+The **?** button in the AvatarHelper panel's header (and *Report a Bug* in the add-on's preferences) opens the
+[issues page](https://github.com/Curtis-VL/AvatarHelper/issues) and copies your AvatarHelper, Blender and system
+versions to the clipboard, ready to paste into the report.
+
 ### Releases
 
 Every push to `main` that changes the add-on publishes a release automatically
