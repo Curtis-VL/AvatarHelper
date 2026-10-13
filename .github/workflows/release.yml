@@ -1,0 +1,68 @@
+# Publishes an installable add-on zip as a GitHub release whenever the add-on changes on main.
+#
+# Version: major.minor come from bl_info["version"] in avatar_helper/__init__.py (bump them by
+# hand for bigger releases); the last number is this workflow's run number, so every release is
+# newer than the one before without editing anything. The version is written into the zip's
+# bl_info, which is what the add-on's update checker compares against the latest release.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "avatar_helper/**"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Work out the version
+        id: version
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import ast, os, re
+          src = open("avatar_helper/__init__.py", encoding="utf-8").read()
+          info = ast.literal_eval(re.search(r"bl_info\s*=\s*(\{.*?\n\})", src, re.S).group(1))
+          major, minor = info["version"][:2]
+          print(f"version={major}.{minor}.{os.environ['GITHUB_RUN_NUMBER']}")
+          EOF
+
+      - name: Build the add-on zip
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          mkdir -p build
+          rsync -a --exclude "__pycache__" --exclude "*.pyc" avatar_helper build/
+          python3 - <<'EOF'
+          import os, re
+          path = "build/avatar_helper/__init__.py"
+          version = tuple(int(x) for x in os.environ["VERSION"].split("."))
+          src = open(path, encoding="utf-8").read()
+          src, n = re.subn(r'("version":\s*)\([^)]*\)', rf"\g<1>{version}", src, count=1)
+          assert n == 1, "bl_info version not found"
+          open(path, "w", encoding="utf-8").write(src)
+          EOF
+          (cd build && zip -qr "../AvatarHelper-${VERSION}.zip" avatar_helper)
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          gh release create "v${VERSION}" "AvatarHelper-${VERSION}.zip" \
+            --title "AvatarHelper ${VERSION}" \
+            --target "${GITHUB_SHA}" \
+            --generate-notes

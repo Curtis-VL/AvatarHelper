@@ -2,6 +2,29 @@
 
 Blender add-on (4.0+) that refits clothing made for one avatar base onto another.
 
+## Install
+
+Download `AvatarHelper-<version>.zip` from the [latest release](https://github.com/Curtis-VL/AvatarHelper/releases/latest)
+(don't unzip it), then in Blender: Preferences → Add-ons → *Install…* (4.2+: the ▾ menu → *Install from Disk…*),
+pick the zip, and enable **AvatarHelper**. The panel is in the 3D view sidebar (N) → *AvatarHelper*.
+
+### Updates
+
+AvatarHelper checks for a newer release when Blender starts (in the background; turn it off in the add-on's
+preferences). When there is one, the panel shows *Update available* with an **Update** button, which downloads
+and installs it; restart Blender to finish. The add-on's preferences also have *Check for Updates* and a link to
+the release notes. A development copy (linked to a git checkout, below) isn't updated this way: use git.
+
+### Releases
+
+Every push to `main` that changes the add-on publishes a release automatically
+(`.github/workflows/release.yml`): an installable zip, with notes listing the changes since the previous one.
+The version is `major.minor.build`: major and minor come from `bl_info["version"]` in
+`avatar_helper/__init__.py` (bump them by hand for bigger releases), and build is the workflow's run number,
+so every release is newer than the last without editing anything. Run the workflow by hand from the Actions
+tab to release without a change. The update check reads the latest release, so it needs the repository (or
+at least its releases) to be public.
+
 ## Install for development
 
 Link the add-on folder into Blender's add-ons directory, so edits are picked up with

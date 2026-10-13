@@ -2,7 +2,7 @@ import os
 
 import bpy
 
-from . import calibration, conversions, rig
+from . import calibration, conversions, rig, updater
 from .calibration import CALIBRATION_KEY
 
 _names = {}  # conversion file stem -> display name, read once per file
@@ -55,6 +55,7 @@ class AH_PT_main(_Panel, bpy.types.Panel):
     def draw(self, context):
         s = context.scene.avatar_helper
         layout = self.layout
+        updater.draw(layout, compact=True)
 
         box = layout.box()
         box.label(text="Conversion (base > your avatar):")

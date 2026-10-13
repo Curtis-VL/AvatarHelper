@@ -2,7 +2,7 @@ import bpy
 from bpy.props import (BoolProperty, CollectionProperty, EnumProperty, FloatProperty, IntProperty, PointerProperty,
                        StringProperty)
 
-from . import conversions
+from . import conversions, updater
 
 
 def _is_mesh(_self, obj):
@@ -163,9 +163,17 @@ class AH_Preferences(bpy.types.AddonPreferences):
     conversions_dir: StringProperty(
         name="Conversions Folder", subtype='DIR_PATH', default="",
         description="Where conversions are saved. Empty uses " + conversions.default_library_dir())
+    check_updates: BoolProperty(
+        name="Check for Updates on Startup", default=True,
+        description="Look up the latest release on GitHub when Blender starts (in the background)")
 
     def draw(self, _context):
-        self.layout.prop(self, "conversions_dir")
+        layout = self.layout
+        layout.prop(self, "conversions_dir")
+        box = layout.box()
+        box.label(text="Updates", icon='FILE_REFRESH')
+        box.prop(self, "check_updates")
+        updater.draw(box)
 
 
 classes = (AH_ClothingItem, AH_Settings, AH_Preferences)

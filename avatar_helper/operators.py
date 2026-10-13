@@ -2,7 +2,7 @@ import bmesh
 import bpy
 import numpy as np
 
-from . import calibration, conversions, finalize, fitting, layers, rig, touchup
+from . import calibration, conversions, finalize, fitting, layers, rig, touchup, updater
 from .bone_map import missing_required
 from .props import is_result
 
@@ -185,6 +185,39 @@ class AH_OT_clear_landmarks(bpy.types.Operator):
     def execute(self, context):
         for o in rig.landmark_objects():
             bpy.data.objects.remove(o, do_unlink=True)
+        return {'FINISHED'}
+
+
+class AH_OT_update_check(bpy.types.Operator):
+    bl_idname = "avatar_helper.update_check"
+    bl_label = "Check for Updates"
+    bl_description = "Look up the latest AvatarHelper release on GitHub"
+
+    def execute(self, _context):
+        updater.check()
+        return {'FINISHED'}
+
+
+class AH_OT_update_install(bpy.types.Operator):
+    bl_idname = "avatar_helper.update_install"
+    bl_label = "Update"
+    bl_description = "Download and install the latest release (takes effect after restarting Blender)"
+
+    @classmethod
+    def poll(cls, _context):
+        return updater.state["status"] == "available"
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, _context):
+        try:
+            updater.install()
+        except Exception as e:
+            self.report({'ERROR'}, f"Update failed: {e}")
+            return {'CANCELLED'}
+        self.report({'INFO'}, f"Installed AvatarHelper {updater.version_text(updater.state['latest'])}: "
+                              "restart Blender to finish")
         return {'FINISHED'}
 
 
@@ -400,6 +433,8 @@ classes = (
     AH_OT_clear_landmarks,
     AH_OT_sort_layers,
     AH_OT_fit,
+    AH_OT_update_check,
+    AH_OT_update_install,
     AH_OT_finalize,
     AH_OT_restore_shape,
     AH_OT_clothing_add,
