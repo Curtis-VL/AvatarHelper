@@ -2,6 +2,10 @@
 
 Blender add-on (4.0+) that refits clothing made for one avatar base onto another.
 
+**Note:** At the moment, no conversions are included, so you'll need both the base of your avatar and the one the clothing is made for to create a conversion. Conversions may need to be re-created after some updates that alter the calibration, be sure to keep a .blend file on hand for to make this quick and easy!
+
+I'll include conversions with a future update so there's no need to create conversions manually for commonly used bases. ^^
+
 ## Install
 
 Download `AvatarHelper-<version>.zip` from the [latest release](https://github.com/Curtis-VL/AvatarHelper/releases/latest)
@@ -25,13 +29,46 @@ If you'd prefer not to share this publicly, feel free to share this with me on D
 
 ## Workflow
 
-### Once per base: create a conversion
+### Once per base pair: Create a conversion
 
-To be written
+<img width="2106" height="1208" alt="1" src="https://github.com/user-attachments/assets/9049caba-420d-4aa1-bb37-6108ea4ca576" />
 
-### Every outfit: fit clothing
+Step by step:
+- Import both bases into the scene. (Armature is hidden in the image for clarity, do not remove the armatures!)
+- Ensure the body mesh of both avatars is **only** the body or body+face, it should be the same on both bases.
+- Select the avatar to fit to, and the base avatar as shown in the image above.
+- Enter a name and click 'Create Conversion'.
 
-To be written
+For fitting clothes from the same avatar at a later date, you won't need to go through this process again.
+
+### Every outfit: Fit clothing
+
+<img width="2106" height="1208" alt="2" src="https://github.com/user-attachments/assets/e736a7ed-32ea-4099-9d8d-d51076e7a1b4" />
+
+Step by step:
+- Import the outfit for an avatar **you've already setup a conversion for with the above steps.**
+- Select the body mesh for the avatar, the same one you used for the calibration. (Ensure it is the same shape as when you calibrated, so body or body+face - Make sure nothing like accessories or hair is part of the mesh)
+- Add clothing meshes to the 'Layers' list, starting with the inner-most (Closest to the skin) and working your way outwards.
+- Click 'Fit Clothing'. (Clicking this again will override un-finalized fitted clothing, so you can change settings and run it again to try different fits)
+
+**Note:** If your outfit has multiple variants, fit one variant first then the next one after finalizing the first. (For example, short and long sleeves, crop top or full length top)
+
+**Limitation:** Right now, shoes cannot be fitted, head wear may also have mixed results. The add-on will scale them to be roughly in the right location and size, but you'll need to do some manual dragging around with proportional editing to get them to fit correctly. (This is usually pretty quick!)
+
+Basic troubleshooting:
+- If an area appears bumpy or warped, select the verticies of that around and a generous area around it, then click 'Restore Original Shape'.
+- If some areas still look incorrect, you can try changing the Solver from Default to 'Shape Preserving' and setting the 'Own Shape Detail' for the affected mesh higher, then click 'Fit Clothing' again. (0.05 is usually a good amount)
+- For some clothing such as a neckless or choker, using the 'Direct' Solver mode seems to show better results, then press 'Fit Clothing' again.
+
+**Happy with the final result?**
+
+Click 'Finalize', this will merge it with your avatar armature and also merge the weights!
+
+The final result:
+
+<img width="480" height="527" alt="3" src="https://github.com/user-attachments/assets/2b247c5e-c928-4f0c-841c-0869d393aa66" />
+
+(Manuka > Selestia in this case)
 
 ### Shape keys
 
