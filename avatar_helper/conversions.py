@@ -23,10 +23,10 @@ import re
 
 import bpy
 import numpy as np
-from mathutils import Matrix
+from mathutils import Matrix, Vector
 
+from . import bone_map, rig
 from . import mesh_utils as mu
-from . import rig
 
 VERSION = 2
 EXTENSION = ".ahconv"
@@ -158,7 +158,7 @@ class Conversion:
         (matching their humanoid joints at rest). An armature that can't be matched is taken
         to be the base's own armature, wherever it is."""
         mapping = rig.armature_map(arm)
-        keys = [k for k in mapping if k in self.src_joints]
+        keys = _alignment_keys(mapping, self.src_joints)
         if self.frame == "world":
             here = [np.array((arm.matrix_world @ arm.data.bones[mapping[k]].head_local)[:]) for k in keys]
             return _align([self.src_joints[k] for k in keys], here)
@@ -169,7 +169,7 @@ class Conversion:
     def target_alignment(self, arm):
         """4x4 matrix carrying the conversion's target space onto the target armature as posed now."""
         mapping = rig.armature_map(arm)
-        keys = [k for k in mapping if k in self.tgt_joints]
+        keys = _alignment_keys(mapping, self.tgt_joints)
         posed = [np.array(rig.posed_head(arm, mapping[k])[:]) for k in keys]
         if self.frame == "world":
             return _align([self.tgt_joints[k] for k in keys], posed)
@@ -179,19 +179,60 @@ class Conversion:
 
     def apply_pose(self, context, arm, align):
         """Pose a clothing armature the way the source rig was posed to match the target.
-        Bones without a humanoid match follow their parents."""
+        Bones without a humanoid match follow their parents.
+
+        The clothing's armature may rest in a different pose than the base did (an outfit
+        made in an A-pose for a base in a T-pose): each bone is first turned to point the way
+        the base's did at rest, then given the base's change. Bones are posed down the chain,
+        each starting where its parent now ends."""
         mapping = rig.armature_map(arm)
         keys = sorted((k for k in mapping if k in self.pose), key=lambda k: rig.bone_depth(arm.data.bones[mapping[k]]))
         rig.reset_pose(arm)
         context.view_layer.update()
         a = Matrix(align.tolist())
         a_inv = a.inverted()
-        inv = arm.matrix_world.inverted()
+        mw = arm.matrix_world
+        inv = mw.inverted()
+        to_rest = self._rest_corrections(arm, mapping, a_inv)
+        a3 = a.to_3x3().normalized()
+        posed = set()
         for k in keys:
-            delta = a @ Matrix(self.pose[k].tolist()) @ a_inv
             bone = arm.data.bones[mapping[k]]
-            arm.pose.bones[bone.name].matrix = inv @ delta @ arm.matrix_world @ bone.matrix_local
+            d = Matrix(self.pose[k].tolist())
+            turn = a3 @ d.to_3x3().normalized() @ to_rest[k] @ a3.inverted()
+            rest = mw @ bone.matrix_local
+            m = (turn @ rest.to_3x3()).to_4x4()
+            if any(p.name in posed for p in bone.parent_recursive):
+                m.translation = mw @ arm.pose.bones[bone.name].head  # where its posed parents put it
+            else:
+                m.translation = a @ d @ a_inv @ rest.translation
+            arm.pose.bones[bone.name].matrix = inv @ m
+            posed.add(bone.name)
             context.view_layer.update()
+
+    def _rest_corrections(self, arm, mapping, a_inv):
+        """Per humanoid key: the rotation (in the conversion's frame) turning this armature's
+        bone to point like the base's bone at rest. Identity when they already agree."""
+        here = {k: np.array((a_inv @ arm.matrix_world @ arm.data.bones[n].head_local)[:]) for k, n in mapping.items()}
+        out = {}
+        for key, children in bone_map.pose_segments():
+            child = next((c for c in children if c in here and c in self.src_joints), None)
+            if key in here and key in self.src_joints and child is not None:
+                mine = Vector(here[child] - here[key])
+                base = Vector(self.src_joints[child] - self.src_joints[key])
+                if mine.length > 1e-6 and base.length > 1e-6:
+                    out[key] = mine.rotation_difference(base).to_matrix()
+        # Bones with nothing to measure by (a hand without fingers, the head, the hips) turn
+        # with the nearest measured bone above them.
+        names = {n: k for k, n in mapping.items()}
+        for k, n in mapping.items():
+            if k in out:
+                continue
+            b = arm.data.bones[n].parent
+            while b is not None and names.get(b.name) not in out:
+                b = b.parent
+            out[k] = out[names[b.name]] if b is not None else Matrix.Identity(3)
+        return out
 
     def feet(self, align):
         """Source foot frames (ankle, tip, floor, width) carried into the clothing's space."""
@@ -202,6 +243,19 @@ class Conversion:
             fl = _apply(align, _floor_point(ankle, floor))[2]
             out[side] = (a, t, float(fl), float(width) * scale)
         return out
+
+
+# Joints that sit in the same place whatever pose the arms rest in (T-pose, A-pose).
+BODY_KEYS = bone_map.CENTRAL + tuple(f"{k}.{s}" for s in "LR"
+                                      for k in ("shoulder", "upper_leg", "lower_leg", "foot", "toes"))
+
+
+def _alignment_keys(mapping, joints):
+    """Humanoid keys to line two armatures up by: the body's (not the arms', which an outfit
+    may rest in another pose), unless there are too few of them."""
+    keys = [k for k in mapping if k in joints]
+    body = [k for k in keys if k in BODY_KEYS]
+    return body if len(body) >= 3 else keys
 
 
 def _floor_point(ankle, floor):
