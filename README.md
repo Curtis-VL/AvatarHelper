@@ -1,4 +1,4 @@
-# AvatarHelper
+# AvatarHelper - Avatar clothing base converter
 
 Blender add-on (4.0+) that refits clothing made for one avatar base onto another.
 
