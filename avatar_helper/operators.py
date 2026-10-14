@@ -7,6 +7,7 @@ from .bone_map import missing_required
 from .props import is_result
 
 HIGH_ERROR = 0.003  # metres; a good calibration is well under 1 mm on average
+HIGH_UNCOVERED = 0.02  # share of the target body the matched base doesn't reach
 
 
 def _ensure_object_mode(context):
@@ -110,12 +111,16 @@ class AH_OT_create_conversion(bpy.types.Operator):
             self.report({'ERROR'}, f"Couldn't save the conversion: {e}")
             return {'CANCELLED'}
         self.report({'INFO'}, "Saved conversion '{conversion}' ({joints} joints, {tips} tips, {landmarks} landmarks). "
-                              "Surface error: mean {m:.1f} mm, 95% {p:.1f} mm, max {x:.1f} mm".format(
+                              "Surface error: mean {m:.1f} mm, 95% {p:.1f} mm, max {x:.1f} mm; "
+                              "your avatar's body reached: {r:.1f}%".format(
                                   m=stats["mean_error"] * 1000, p=stats["p95_error"] * 1000,
-                                  x=stats["max_error"] * 1000, **stats))
+                                  x=stats["max_error"] * 1000, r=(1.0 - stats["uncovered"]) * 100, **stats))
         if stats["mean_error"] > HIGH_ERROR:
             self.report({'WARNING'}, "The bodies didn't match up well. Check both bodies are the right meshes "
                                      "(Check Bone Mapping, and Show Calibration for the error map)")
+        if stats["uncovered"] > HIGH_UNCOVERED:
+            self.report({'WARNING'}, f"{stats['uncovered'] * 100:.0f}% of your avatar's body isn't reached by the base "
+                                     "body (Show Calibration to see where); add landmark pairs there and create it again")
         return {'FINISHED'}
 
 

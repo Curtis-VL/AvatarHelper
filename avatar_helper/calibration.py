@@ -70,6 +70,9 @@ def create_conversion(context, s, progress=None):
     if not src_body or not tgt_body:
         raise ValueError("Set both the source and target body meshes")
     src_arm, tgt_arm = source_armature(s), target_armature(s)
+    for body, arm in ((src_body, src_arm), (tgt_body, tgt_arm)):
+        if arm is None and any(m.type == 'ARMATURE' and m.object is None for m in body.modifiers):
+            raise ValueError(f"'{body.name}' has an Armature modifier with no armature set in it")
     if not src_arm or not tgt_arm:
         raise ValueError("Both bodies need an armature (set it, or give the body an Armature modifier)")
 
@@ -116,6 +119,45 @@ def save_conversion(s, cal):
     return conv.name
 
 
+BODY_NEAR = 0.005  # a part of the target mesh counts as body once most of it is this close
+
+
+def _body_parts(tgt_verts, labels, dist):
+    """Target vertices on parts of the mesh lying mostly on the matched source body (the body
+    itself, not hair or accessories merged into the mesh)."""
+    near = np.bincount(labels, weights=(dist < BODY_NEAR).astype(float)) / np.bincount(labels)
+    return near[labels] > 0.5
+
+
+def _reverse_pull(warped, tris, normals, tgt_verts, tgt_normals, tgt_labels, s):
+    """Each target body point pulls the nearest point of the warped source body towards it,
+    shared among that triangle's corners. Returns per source vertex (sum of pulls, weight)."""
+    num = np.zeros_like(warped)
+    den = np.zeros(len(warped))
+    loc, nrm, idx, dist = mu.nearest_on(mu.build_bvh(warped, tris), tgt_verts, s.search_distance)
+    body = _body_parts(tgt_verts, tgt_labels, np.where(idx >= 0, dist, np.inf))
+    ok = body & (idx >= 0) & ((tgt_normals * nrm).sum(1) > s.normal_threshold)
+    if not ok.any():
+        return num, den
+    t = tris[idx[ok]]
+    bary = mu.barycentric(loc[ok], warped[t[:, 0]], warped[t[:, 1]], warped[t[:, 2]])
+    pull = tgt_verts[ok] - loc[ok]
+    for c in range(3):
+        for k in range(3):
+            num[:, k] += np.bincount(t[:, c], weights=bary[:, c] * pull[:, k], minlength=len(warped))
+        den += np.bincount(t[:, c], weights=bary[:, c], minlength=len(warped))
+    return num, den
+
+
+def _uncovered(warped, tris, tgt_verts, tgt_labels, gap=0.005):
+    """Share of the target body that the matched source body doesn't reach (further than
+    `gap`): a big unmatched shape shows up here, not in the source-to-target error."""
+    _loc, _nrm, idx, dist = mu.nearest_on(mu.build_bvh(warped, tris), tgt_verts, 0.2)
+    dist = np.where(idx >= 0, dist, np.inf)
+    body = _body_parts(tgt_verts, tgt_labels, dist)
+    return float((dist[body] > gap).mean()) if body.any() else 0.0
+
+
 def calibrate(context, s, progress=None):
     src_body, tgt_body = s.source_body, s.target_body
     dg = context.evaluated_depsgraph_get()
@@ -157,7 +199,14 @@ def calibrate(context, s, progress=None):
     # Stage 2: non-rigid ICP. Pull each vertex towards the target surface through a
     # membrane that is stiff at first (overall shape) and loose at the end (local detail).
     # Unmatched areas (e.g. toes pointing a different way) follow their matched neighbours.
+    # Matching goes both ways: each source point is pulled to the nearest target point, and
+    # each target point pulls the nearest source point to it. One way only, a much larger
+    # target shape (bigger breasts) is never reached: the source points all find closer spots
+    # around its base, and its front is left uncovered.
     bvh = mu.build_bvh(tgt_verts, tgt_tris)
+    tgt_normals = mu.vertex_normals(tgt_verts, tgt_tris)
+    tgt_edges = mu.evaluated_mesh_world(tgt_body, dg)[2]
+    tgt_labels = mu.islands(len(tgt_verts), tgt_edges)
     adj = mu.Adjacency(len(base), edges)
     iters = max(1, s.icp_iterations)
     stiff_start = max(float(s.icp_smoothing), 1.0)
@@ -167,13 +216,19 @@ def calibrate(context, s, progress=None):
         normals = mu.vertex_normals(warped, tris)
         loc, nrm, idx, _dist = mu.nearest_on(bvh, warped, s.search_distance)
         valid = (idx >= 0) & ((normals * nrm).sum(1) > s.normal_threshold)
-        residual = (loc - warped) * valid[:, None]
-        warped += adj.solve_membrane(residual, valid.astype(np.float64), stiffness)
+        num = (loc - warped) * valid[:, None]
+        den = valid.astype(np.float64)
+        rnum, rden = _reverse_pull(warped, tris, normals, tgt_verts, tgt_normals, tgt_labels, s)
+        num += rnum
+        den += rden
+        residual = num / np.maximum(den, 1e-9)[:, None]
+        warped += adj.solve_membrane(residual, np.minimum(den, 1.0), stiffness)
         if progress:
             progress((it + 1) / iters)
 
     _loc, _nrm, idx, dist = mu.nearest_on(bvh, warped, 1.0)
     dist = np.where(idx >= 0, dist, 1.0)
+    uncovered = _uncovered(warped, tris, tgt_verts, tgt_labels)
 
     cal.shape_key_add(name="Basis", from_mix=False)
     key = cal.shape_key_add(name=CALIBRATION_KEY, from_mix=False)
@@ -200,4 +255,5 @@ def calibrate(context, s, progress=None):
         "mean_error": float(dist.mean()),
         "p95_error": float(np.percentile(dist, 95)),
         "max_error": float(dist.max()),
+        "uncovered": uncovered,
     }
