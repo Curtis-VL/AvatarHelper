@@ -113,11 +113,17 @@ In *Advanced* (under Fit Clothing):
 | Rigid Part Size, `AH_Rigid` vertex group | Parts that move without deforming (buttons, buckles, armour plates). |
 | Min Gap / Collide With Lower Layers | Outward-only push to clear the body and the layers listed above. |
 
-## Known limitations / next steps
+## Known limitations
 
 - Shoes will not be fitted correctly. They will be scaled to the right size, but will need some manual adjustment!
 - Items attached to the head may not be in the correct location or may be warped.
 - Bras/bikini tops may not be in the perfect location and may need moving up or down a little manually.
+
+## AI usage
+
+This project was pretty much entirely AI generated, but it's free for you to use, it works well in my experience, and it saves a lot of time!
+
+If you'd prefer not to use an AI generated tool, feel free not to use it.
 
 ## Need more help?
 
