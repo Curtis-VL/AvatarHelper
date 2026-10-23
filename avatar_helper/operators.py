@@ -119,8 +119,11 @@ class AH_OT_create_conversion(bpy.types.Operator):
             self.report({'WARNING'}, "The bodies didn't match up well. Check both bodies are the right meshes "
                                      "(Check Bone Mapping, and Show Calibration for the error map)")
         if stats["uncovered"] > HIGH_UNCOVERED:
+            where = f", mostly around the {stats['uncovered_where']}" if stats["uncovered_where"] else ""
             self.report({'WARNING'}, f"{stats['uncovered'] * 100:.0f}% of your avatar's body isn't reached by the base "
-                                     "body (Show Calibration to see where); add landmark pairs there and create it again")
+                                     f"body{where} (Show Calibration to see it). If the base has that part, add "
+                                     "landmark pairs there and create it again; if it's a separate mesh (e.g. the "
+                                     "head), clothing there may fit less closely")
         return {'FINISHED'}
 
 
@@ -279,7 +282,12 @@ class AH_OT_restore_shape(bpy.types.Operator):
         description="Blend into the unselected part over this distance, so there's no visible seam")
     keep_outside: bpy.props.BoolProperty(
         name="Keep Outside Body", default=True,
-        description="Points that were outside the avatar's body (set in the panel) stay outside it")
+        description="Keep the restored part outside the avatar's body (set in the panel)")
+    leave_hidden: bpy.props.BoolProperty(
+        name="Leave Hidden Parts", default=True,
+        description="Leave parts the fit kept inside the body on purpose (a tucked-in hem) as they are. Turn off "
+                    "to restore them too and push them out of the body, e.g. where the base's anatomy pressed into "
+                    "the clothing")
 
     @classmethod
     def poll(cls, context):
@@ -290,6 +298,17 @@ class AH_OT_restore_shape(bpy.types.Operator):
         obj = context.edit_object
         bm = bmesh.from_edit_mesh(obj.data)
         bm.verts.ensure_lookup_table()
+        bm.verts.index_update()  # indices go stale after adding or removing geometry
+        try:
+            original = touchup.original_of(obj)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        if len(bm.verts) != len(original.data.vertices):
+            self.report({'ERROR'}, f"'{obj.name}' now has {len(bm.verts)} vertices but '{original.name}' has "
+                                   f"{len(original.data.vertices)}: the shape can only be restored on the mesh as "
+                                   "fitted (undo the added or removed geometry, or fit it again)")
+            return {'CANCELLED'}
         coords = np.array([v.co[:] for v in bm.verts])
         selected = np.array([v.select for v in bm.verts])
         if not selected.any():
@@ -301,7 +320,7 @@ class AH_OT_restore_shape(bpy.types.Operator):
         body = s.target_body if self.keep_outside else None
         try:
             new = touchup.restore_shape(context, obj, coords, selected, tris, edges, self.scale, self.falloff,
-                                        body, s.collision_offset)
+                                        body, s.collision_offset, self.leave_hidden)
         except ValueError as e:
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}

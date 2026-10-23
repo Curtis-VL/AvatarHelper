@@ -18,6 +18,7 @@ LINK_WEIGHT = 10.0  # weight of links across a thin part or between interlocked 
 CONSTRAINT_WEIGHT = 10.0  # pull of a collision constraint, relative to an edge
 LINK_GAP = 0.002  # separate pieces closer than this are linked (a ring and its strap loop)
 THICKNESS_LINK = 0.006  # the two sides of a part closer than this are linked
+CONTACT_GAP = 0.001  # surfaces facing each other across less air than this count as touching
 
 
 class _Graph:
@@ -66,16 +67,21 @@ class _Graph:
 def links(verts, tris, edges, thickness):
     """Pairs tying together surfaces that share no edges: the two sides of a thin part
     (a hem's lining under its outer layer, a strap's inner and outer side), found by
-    casting a short ray through the material, and separate pieces touching each other."""
+    casting a short ray into the material, and separate pieces touching each other.
+
+    Out through the air the ray finds surfaces facing this one across a gap: layers pressed
+    together (a folded collar lying on the knit) are tied too, but only when practically
+    touching. Further apart they're separate parts, such as a glove's neighbouring fingers,
+    which tied together would be pulled into one."""
     pairs = []
     if len(tris):
         bvh = mu.build_bvh(verts, tris)
         normals = mu.vertex_normals(verts, tris)
         for i, (p, n) in enumerate(zip(verts.tolist(), normals.tolist())):
-            for sign in (-1.0, 1.0):
+            for sign, reach in ((-1.0, thickness), (1.0, CONTACT_GAP)):
                 d = (n[0] * sign, n[1] * sign, n[2] * sign)
                 start = (p[0] + d[0] * 1e-5, p[1] + d[1] * 1e-5, p[2] + d[2] * 1e-5)
-                loc, nrm, idx, dist = bvh.ray_cast(start, d, thickness)
+                loc, nrm, idx, dist = bvh.ray_cast(start, d, reach)
                 if idx is None or dist < 1e-4:
                     continue
                 # The other side faces the other way; this skips the vertex's own neighbouring faces.

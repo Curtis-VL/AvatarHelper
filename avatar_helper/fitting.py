@@ -15,13 +15,14 @@ import math
 import os
 import re
 
+import bmesh
 import bpy
 import numpy as np
 from mathutils import Matrix, Vector
 from mathutils.kdtree import KDTree
 
 from . import mesh_utils as mu
-from . import conversions, elastic, rig
+from . import conversions, elastic, limbs, rig
 from .calibration import CALIBRATION_KEY, output_collection, shape_key_values, target_armature
 from .props import is_result
 from .rbf import RBFWarp
@@ -41,13 +42,23 @@ class SurfaceBinding:
     The frames use smoothly interpolated normals (like smooth shading), so offsets don't
     jump at triangle edges, which would press the surface's polygons into the clothing."""
 
-    def __init__(self, base, fitted, tris):
+    def __init__(self, base, fitted, tris, crease_width=0.0):
         self.base = base
         self.fitted = fitted
         self.tris = tris
         self.bvh = mu.build_bvh(base, tris)
-        self.base_normals = mu.vertex_normals(base, tris)
-        self.fit_normals = mu.vertex_normals(fitted, tris)
+        # Points are carried along both bodies with their narrow creases filled in, the way
+        # fabric bridges them: a tight garment then keeps its shape over a crotch or toes
+        # instead of being pressed into whatever detail the target has there. (Collisions
+        # still use the real bodies.)
+        if crease_width > 0.0:
+            self.bind_base = mu.fill_creases(base, tris, crease_width)
+            self.bind_fitted = mu.fill_creases(fitted, tris, crease_width)
+            self.bind_bvh = mu.build_bvh(self.bind_base, tris)
+        else:
+            self.bind_base, self.bind_fitted, self.bind_bvh = base, fitted, self.bvh
+        self.base_normals = mu.vertex_normals(self.bind_base, tris)
+        self.fit_normals = mu.vertex_normals(self.bind_fitted, tris)
 
     @staticmethod
     def _frames(verts, vnormals, t, bary):
@@ -60,7 +71,7 @@ class SurfaceBinding:
     def surface_warp(self, pts, max_dist):
         """Returns (moved points, distance to the surface, whether a triangle was found,
         signed offset along the surface normal: > 0 on the outer side)."""
-        loc, _nrm, idx, dist = mu.nearest_on(self.bvh, pts, max_dist)
+        loc, _nrm, idx, dist = mu.nearest_on(self.bind_bvh, pts, max_dist)
         ok = idx >= 0
         out = pts.copy()
         side = np.zeros(len(pts))
@@ -68,12 +79,12 @@ class SurfaceBinding:
             return out, dist, ok, side
         ti = idx[ok]
         t = self.tris[ti]
-        b = self.base
+        b = self.bind_base
         bary = mu.barycentric(loc[ok], b[t[:, 0]], b[t[:, 1]], b[t[:, 2]])
         rel = pts[ok] - loc[ok]
         e1, e2, n = self._frames(b, self.base_normals, t, bary)
         coef = np.stack([(rel * e1).sum(1), (rel * e2).sum(1), (rel * n).sum(1)], axis=1)
-        f = self.fitted
+        f = self.bind_fitted
         anchor = (bary[:, :1] * f[t[:, 0]] + bary[:, 1:2] * f[t[:, 1]] + bary[:, 2:] * f[t[:, 2]])
         g1, g2, gn = self._frames(f, self.fit_normals, t, bary)
         out[ok] = anchor + coef[:, :1] * g1 + coef[:, 1:2] * g2 + coef[:, 2:] * gn
@@ -84,19 +95,20 @@ class SurfaceBinding:
 class FitField(SurfaceBinding):
     """The calibration as a deformation: a smooth space warp plus binding to the body surface."""
 
-    def __init__(self, base, fitted, tris, resolution, smoothing, max_centers=2500, grid=None, grid_unit=1.0):
-        super().__init__(base, fitted, tris)
+    def __init__(self, base, fitted, tris, resolution, smoothing, max_centers=2500, grid=None, grid_unit=1.0,
+                 crease_width=0.0):
+        super().__init__(base, fitted, tris, crease_width)
         centers, values = mu.voxel_downsample(base, fitted - base, resolution / grid_unit, max_centers, grid)
         self.rbf = RBFWarp(centers, values, smoothing)
 
     @classmethod
-    def from_conversion(cls, conv, src_align, tgt_align, resolution, smoothing):
+    def from_conversion(cls, conv, src_align, tgt_align, resolution, smoothing, crease_width=0.0):
         """The conversion placed in this scene: its source side on the clothing's armature,
         its target side on the target avatar. The warp is sampled in the conversion's own
         frame, so where the clothing stands doesn't change it."""
         unit = float(np.cbrt(abs(np.linalg.det(src_align[:3, :3]))))
         return cls(mu.transform_points(src_align, conv.base), mu.transform_points(tgt_align, conv.fitted),
-                   conv.tris, resolution, smoothing, grid=conv.base, grid_unit=unit)
+                   conv.tris, resolution, smoothing, grid=conv.base, grid_unit=unit, crease_width=crease_width)
 
     @classmethod
     def from_object(cls, cal_obj, resolution, smoothing):
@@ -188,33 +200,59 @@ def _group_touching(verts, parts, max_size):
 def push_out(points, colliders):
     """Outward-only push so every point sits at least its gap outside each collider.
 
-    colliders: (bvh, skip, depth, gaps) tuples. `skip` marks points exempt from that
-    collider (parts that sat under it on the source, like a tucked-in shirt hem), or is
+    colliders: (bvh, skip, depth, gaps[, surface]) tuples. `skip` marks points exempt from
+    that collider (parts that sat under it on the source, like a tucked-in shirt hem), or is
     None. `depth` is how far inside a point may be and still count as colliding. `gaps`
-    is the clearance to keep, per point.
+    is the clearance to keep, per point. `surface`, a SmoothSide for the collider's mesh,
+    tells inside from outside at its edges and corners too (see SmoothSide).
     """
     push = np.zeros_like(points)
     for i, p in enumerate(points.tolist()):
         best = 0.0
         pv = Vector(p)
-        for bvh, skip, depth, gaps in colliders:
+        for bvh, skip, depth, gaps, *surface in colliders:
             if skip is not None and skip[i]:
                 continue
             offset = gaps[i]
-            loc, nrm, _idx, d = bvh.find_nearest(p, depth + offset)
+            loc, nrm, idx, d = bvh.find_nearest(p, depth + offset)
             if loc is None:
                 continue
             rel = pv - loc
             side = rel.dot(nrm)
-            # Skip hits on open edges reached from beyond the surface (e.g. below a shirt hem).
             if d > 1e-5 and abs(side) / d < 0.7:
-                continue
+                # Nearest to an edge or corner, not a face. On an open edge reached from
+                # beyond the surface (e.g. below a shirt hem) that's no collision. Elsewhere
+                # (a crease such as a crotch, seen from inside) it can be.
+                if not surface or surface[0] is None or surface[0].open_edge(idx):
+                    continue
+                nrm = surface[0].normal(idx, loc)
+                side = rel.dot(nrm)
             if side < offset:
                 v = loc + nrm * offset - pv
                 if v.length > best:
                     best = v.length
                     push[i] = v
     return push
+
+
+class SmoothSide:
+    """Inside or outside of a mesh where the nearest point is on an edge or a corner, where a
+    face's own normal can't tell: by the vertex normals blended across the face there."""
+
+    def __init__(self, verts, tris, vertex_normals):
+        self.verts, self.tris, self.normals = verts, tris, vertex_normals
+        e = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
+        _u, inv, counts = np.unique(e, axis=0, return_inverse=True, return_counts=True)
+        self.open = (counts[inv.ravel()] == 1).reshape(3, -1).any(0)
+
+    def open_edge(self, tri):
+        return bool(self.open[tri])
+
+    def normal(self, tri, loc):
+        ids = self.tris[tri]
+        bary = mu.barycentric(np.array([loc[:]]), *(self.verts[ids[k]][None] for k in range(3)))[0]
+        n = np.clip(bary, 0.0, 1.0) @ self.normals[ids]
+        return Vector(n).normalized()
 
 
 POKE_DEPTH = 0.01  # deeper "pokes" are usually skin showing through an opening on purpose
@@ -439,10 +477,13 @@ class StackedPieces:
         return self.src_gaps[lower]
 
 
+CREASE_WIDTH = 0.02  # creases narrower than this are bridged, as fabric would (see SurfaceBinding)
+LIMB_FOLLOW = True  # fingers and toes follow their bones (limbs.py)
 HEM_RANGE = 0.015  # how close to an open edge a part inside the body must be to stay hidden
+COVER_RANGE = 0.05  # how far out another garment hiding a part inside the body may be
 
 
-def hidden_parts(field, verts, tris):
+def hidden_parts(field, verts, tris, covers=()):
     """Clothing tucked into the source body is hidden by design: a hem curling in under a
     waistband, a strap end disappearing into the thigh, a sock's toe squeezed inside the
     foot to fit a shoe. Such parts are carried along at the same depth rather than pushed
@@ -450,18 +491,30 @@ def hidden_parts(field, verts, tris):
 
     A thin part that merely dips into the skin (the inner side of a strap, with its outer
     side right above it) doesn't count: it is pushed out whole as usual, which keeps it
-    clean. So a part inside the body stays hidden only if it is near an open edge, or if
-    nothing of the same garment lies over it.
+    clean. Nor does the base's body pressing through the middle of a garment with nothing
+    over it (anatomy through the crotch of shorts): that is clipping on the base, and copying
+    it onto an avatar without that detail sinks the garment into the body. So a part inside
+    the body stays hidden only if it is near an open edge that is inside the body too (with
+    none of the same garment over it), or if nothing of the same garment but another garment
+    (`covers`: BVHs of the outfit's other meshes, e.g. a shoe) lies over it.
+
+    This is decided per connected area inside the body, by majority, so one area is treated
+    the same throughout: decided point by point, a gusset passing into the base's body would
+    have some points kept inside and their neighbours pushed out, folding it over between.
     """
     loc, nrm, idx, _dist = mu.nearest_on(field.bvh, verts, 0.05)
     inside = (idx >= 0) & (((verts - loc) * nrm).sum(1) < 0.0)
     if not inside.any():
         return inside
     ids = np.nonzero(inside)[0]
-    covered_by_self = mu.rays_hit(verts[ids], nrm[ids], mu.build_bvh(verts, tris), THICKNESS_MAX)
+    self_bvh = mu.build_bvh(verts, tris)
+    covered_by_self = mu.rays_hit(verts[ids], nrm[ids], self_bvh, THICKNESS_MAX)
     edges = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
     uniq, counts = np.unique(edges, axis=0, return_counts=True)
+    # Only an open edge that goes into the body itself: shorts' leg openings around the thighs
+    # don't make the crotch between them a tucked-in hem.
     rim = np.unique(uniq[counts == 1])
+    rim = rim[inside[rim]]
     near_rim = np.zeros(len(ids), dtype=bool)
     if len(rim):
         kd = KDTree(len(rim))
@@ -469,8 +522,42 @@ def hidden_parts(field, verts, tris):
             kd.insert(verts[i].tolist(), i)
         kd.balance()
         near_rim = np.array([kd.find(verts[i].tolist())[2] < HEM_RANGE for i in ids.tolist()])
-    inside[ids] = near_rim | ~covered_by_self
-    return inside
+    # An inner piece under the garment's own outer layer (a crotch gusset inside the base's
+    # body) is out of sight however it's fitted, and pushed out it supports the layer over it.
+    under_self = mu.rays_hit(verts[ids], nrm[ids], self_bvh, COVER_RANGE)
+    covered_by_other = np.zeros(len(ids), dtype=bool)
+    for bvh in covers:
+        covered_by_other |= mu.rays_hit(verts[ids], nrm[ids], bvh, COVER_RANGE)
+    vote = np.zeros(len(verts))
+    vote[ids] = ((near_rim & ~under_self) | (~covered_by_self & covered_by_other)).astype(float)
+    # Connected areas inside the body (edges with both ends inside).
+    both = inside[uniq[:, 0]] & inside[uniq[:, 1]]
+    areas = mu.islands(len(verts), uniq[both])
+    share = np.bincount(areas, weights=vote) / np.maximum(np.bincount(areas, weights=inside.astype(float)), 1e-9)
+    return inside & (share[areas] > 0.5)
+
+
+BRIDGE_RANGE = 0.02  # how far around a point its gap to the body is compared
+BRIDGE_SPREAD = (0.002, 0.006)  # gap varying less than this: hugging the body; more: bridging
+
+
+def bridging(verts, edges, gap):
+    """0..1 per point: how much the garment bridges over the body there instead of hugging it.
+    A garment that hugs the body keeps about the same gap to it; one stretched smooth over
+    body detail (a crotch, a navel, ribs) has a gap that changes quickly, inside the detail
+    one moment and well clear of it the next. Copying the base's detail into it then shows."""
+    have = np.isfinite(gap)
+    g = np.where(have, gap, 0.0)
+    if not len(edges) or not have.any():
+        return np.zeros(len(verts))
+    edge_len = float(np.median(np.linalg.norm(verts[edges[:, 0]] - verts[edges[:, 1]], axis=1)))
+    steps = int(min(200, round(2.0 * (BRIDGE_RANGE / max(edge_len, 1e-5)) ** 2)))
+    adj = mu.Adjacency(len(verts), edges)
+    sm = adj.smooth(np.stack([g, g * g], axis=1), steps, weights=have.astype(float))
+    spread = np.sqrt(np.maximum(sm[:, 1] - sm[:, 0] ** 2, 0.0))
+    lo, hi = BRIDGE_SPREAD
+    t = np.clip((spread - lo) / (hi - lo), 0.0, 1.0)
+    return np.where(have, t * t * (3.0 - 2.0 * t), 0.0)
 
 
 MIN_CLEARANCE = 0.0002  # clothing never ends up closer than this to what it rests on
@@ -485,19 +572,27 @@ def clearance(verts, src_bvh, max_gap):
     return np.where(idx >= 0, np.clip(side, MIN_CLEARANCE, max_gap), max_gap)
 
 
-def fit_points(obj, verts, tris, edges, field, s, solver, detail, body=None, layers=()):
+def fit_points(obj, verts, tris, edges, field, s, solver, detail, body=None, layers=(), info=None, covers=(),
+               limb_follow=None):
     """solver: 'ELASTIC' or 'DIRECT'; detail: Shape Detail for the elastic solver.
-    body: (verts, normals, bvh) of the target body, or None. layers: fitted lower Layers."""
+    body: (verts, normals, bvh) of the target body, or None. layers: fitted lower Layers.
+    info: optional dict, receives "hidden" (the parts kept inside the body by design) and
+    "poked" (a garment vertex where each point of the base comes through it, and how many
+    points of the base it lies over).
+    covers: BVHs of the outfit's other meshes as on the source, which can hide parts of this one.
+    limb_follow: a limbs.LimbFollow for the garment's armature, or None."""
     adj = mu.Adjacency(len(verts), edges)
     relations = layer_relations(verts, tris, layers, field.bvh) if s.collide_layers else []
 
-    hidden = hidden_parts(field, verts, tris)
+    hidden = hidden_parts(field, verts, tris, covers)
+    if info is not None:
+        info["hidden"] = hidden
 
     colliders = []
     pokers = []
     if body is not None:
         body_gaps = clearance(verts, field.bvh, s.collision_offset)
-        colliders.append((body[2], hidden, BODY_DEPTH, body_gaps))
+        colliders.append((body[2], hidden, BODY_DEPTH, body_gaps, body[3] if len(body) > 3 else None))
         # Body detail that already poked through this item on the source (e.g. toes through
         # socks meant to be hidden in shoes) may keep doing so; elsewhere it is pushed back
         # under. Each target body vertex looks this up at the nearest point of the
@@ -509,6 +604,11 @@ def fit_points(obj, verts, tris, edges, field, s, solver, detail, body=None, lay
                  & (np.abs(side) >= 0.9 * np.maximum(dist, 1e-9)))
         mask = ~poked[field.nearest_vertex(body[0])] if poked.any() else np.ones(len(body[0]), dtype=bool)
         pokers.append((body[0][mask], body[1][mask], body_gaps))
+        if info is not None:
+            # For telling the user when the base comes through the clothing a lot: the
+            # garment may be made for another shape of the base (a shrink or heel key).
+            covered = (idx >= 0) & ((nrm * base_normals).sum(1) > 0.5)
+            info["poked"] = (tris[idx[poked]][:, 0], int(covered.sum()))
     for layer, (_tucked, covered, exempt) in zip(layers, relations):
         gaps = (clearance(verts, layer.binding.bvh, s.collision_offset) if layer.binding is not None
                 else np.full(len(verts), s.collision_offset))
@@ -517,10 +617,15 @@ def fit_points(obj, verts, tris, edges, field, s, solver, detail, body=None, lay
             pokers.append((layer.fit_verts[covered], mu.vertex_normals(layer.fit_verts, layer.tris)[covered], gaps))
 
     warped = field.warp(verts)
-    out = warped.copy()
-    near, dist, ok, _side = field.surface_warp(verts, s.skin_distance + s.blend_distance)
+    near, dist, ok, side = field.surface_warp(verts, s.skin_distance + s.blend_distance)
     w = np.where(ok, _smoothstep_falloff(dist, s.skin_distance, s.blend_distance), 0.0)
-    out = out * (1.0 - w[:, None]) + near * w[:, None]
+    # Where the garment bridges over body detail instead of hugging it, it follows the smooth
+    # warp: binding it to the skin there would copy the base's detail into it.
+    w *= 1.0 - bridging(verts, edges, np.where(ok, side, np.nan))
+    out = warped * (1.0 - w[:, None]) + near * w[:, None]
+    if limb_follow is not None:
+        follow, wf = limb_follow(obj, verts)
+        out = out * (1.0 - wf[:, None]) + follow * wf[:, None]
     if relations:
         out = follow_layers(verts, out, dist, layers, relations, s)
 
@@ -738,6 +843,37 @@ def fit_armature(context, arm, field, coll):
     return new
 
 
+HIDDEN_ATTRIBUTE = "ah_hidden"
+
+
+def mark_hidden(obj, hidden):
+    """Remember which parts were kept inside the body by design (a tucked-in hem), for the
+    touch-up tools: they leave those alone, and push anything else back out of the body."""
+    me = obj.data
+    if HIDDEN_ATTRIBUTE in me.attributes:
+        me.attributes.remove(me.attributes[HIDDEN_ATTRIBUTE])
+    if hidden is None or len(hidden) != len(me.vertices):
+        return
+    # An integer attribute: Edit Mode (where the touch-up tools run) can read those, not booleans.
+    attr = me.attributes.new(HIDDEN_ATTRIBUTE, 'INT', 'POINT')
+    attr.data.foreach_set("value", np.asarray(hidden, dtype=np.int32))
+
+
+def hidden_marks(obj):
+    """The parts marked by mark_hidden, or None for meshes fitted before it existed."""
+    me = obj.data
+    if obj.mode == 'EDIT':
+        bm = bmesh.from_edit_mesh(me)
+        layer = bm.verts.layers.int.get(HIDDEN_ATTRIBUTE)
+        return None if layer is None else np.array([v[layer] != 0 for v in bm.verts], dtype=bool)
+    attr = me.attributes.get(HIDDEN_ATTRIBUTE)
+    if attr is None or attr.domain != 'POINT' or attr.data_type != 'INT':
+        return None
+    out = np.zeros(len(me.vertices), dtype=np.int32)
+    attr.data.foreach_get("value", out)
+    return out != 0
+
+
 def remove_previous(names):
     names = set(names)
     for o in list(bpy.data.objects):
@@ -896,18 +1032,32 @@ def match_shape_keys(objs, values):
     values the base had when the conversion was made: the conversion only fits clothing
     shaped for the base as it was then. Returns (key, old value) pairs to restore later, and
     a description of what changed."""
-    wanted = {_key_name(k): v for k, v in values.items()}
+    wanted = {_key_name(k): (k, v) for k, v in values.items()}
+    # Clothing keys often add a number to the base's name ("Foot_heel2" for "Foot_heel"):
+    # matched too, when that leaves only one base key it could be.
+    loose = {}
+    for name, item in wanted.items():
+        loose.setdefault(name.rstrip("0123456789"), []).append(item)
     saved, changes = [], []
     for o in objs:
         keys = o.data.shape_keys
         if keys is None:
             continue
+        own = {_key_name(kb.name) for kb in keys.key_blocks}
         for kb in keys.key_blocks:
-            v = wanted.get(_key_name(kb.name)) if kb != keys.reference_key else None
-            if v is not None and abs(kb.value - v) > 1e-4:
+            if kb == keys.reference_key:
+                continue
+            name = _key_name(kb.name)
+            match = wanted.get(name)
+            if match is None:
+                near = loose.get(name.rstrip("0123456789"), [])
+                if len(near) == 1 and _key_name(near[0][0]) not in own:
+                    match = near[0]
+            if match is not None and abs(kb.value - match[1]) > 1e-4:
                 saved.append((kb, kb.value))
-                changes.append(f"{o.name} '{kb.name}' {kb.value:g} → {v:g}")
-                kb.value = v
+                as_base = "" if _key_name(match[0]) == name else f" (as the base's '{match[0]}')"
+                changes.append(f"{o.name} '{kb.name}' {kb.value:g} → {match[1]:g}{as_base}")
+                kb.value = match[1]
     return saved, changes
 
 
@@ -952,7 +1102,8 @@ def fit_clothing(context, s, progress=None, notes=None):
     def field_for(align):
         key = tuple(np.round(align, 5).ravel())
         if key not in fields:
-            fields[key] = FitField.from_conversion(conv, align, tgt_align, s.field_resolution, s.field_smoothing)
+            fields[key] = FitField.from_conversion(conv, align, tgt_align, s.field_resolution, s.field_smoothing,
+                                                   CREASE_WIDTH)
         return fields[key]
 
     def align_of(o):
@@ -991,10 +1142,23 @@ def fit_clothing(context, s, progress=None, notes=None):
         if s.replace_previous:
             remove_previous([o.name for o in objs] + [a.name for a in arms])
 
+        # Fingers and toes follow their bones (see limbs.py), measured in the matched pose.
+        limb_maps = {}
+        if LIMB_FOLLOW:
+            tgt_verts = mu.evaluated_mesh_world(s.target_body, context.evaluated_depsgraph_get())[0]
+            target = (tgt_verts, limbs.vertex_keys(s.target_body, tgt_arm, len(tgt_verts)))
+            limb_maps = {a: limbs.LimbFollow(a, tgt_arm, src_align[a], tgt_align, conv, s.collision_offset, target)
+                         for a in arms}
+
+        def limbs_for(o):
+            obj_arms = deforming_armatures(o)
+            lf = limb_maps.get(obj_arms[0]) if obj_arms else None
+            return lf if lf is not None and lf.any() else None
+
         coll = output_collection(context.scene, FITTED_COLLECTION)
         arm_map = {a: fit_armature(context, a, field_for(src_align[a]), coll) for a in arms}
         return _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_feet,
-                           field_for, align_of, arms, arm_map, coll, progress)
+                           field_for, align_of, arms, arm_map, coll, progress, limbs_for, notes)
     finally:
         for pb, m in saved_pose:
             pb.matrix_basis = m
@@ -1003,8 +1167,46 @@ def fit_clothing(context, s, progress=None, notes=None):
         context.view_layer.update()
 
 
+POKE_NOTE = 0.15  # share of the base under a garment coming through it worth a note
+POKE_NOTE_MIN = 30  # points
+
+
+def _poke_note(obj, poked_at, covered):
+    """A note when much of the base comes through a garment, naming where."""
+    if covered == 0 or len(poked_at) < POKE_NOTE_MIN or len(poked_at) / covered < POKE_NOTE:
+        return None
+    arms = deforming_armatures(obj)
+    where = ""
+    if arms:
+        keys = limbs.vertex_keys(obj, arms[0], len(obj.data.vertices))[poked_at]
+        keys = [k for k in keys if k]
+        if keys:
+            values, counts = np.unique(keys, return_counts=True)
+            from .calibration import _part_name
+            where = _part_name(str(values[np.argmax(counts)])) + " "
+    return (f"The base's {where}comes through '{obj.name}' in places ({len(poked_at) / covered:.0%} of what it "
+            f"covers): it may be made for another shape of the base. Check its shape keys against the base's "
+            f"(e.g. a shrink or heel key), then fit again")
+
+
+def _outfit_meshes(context, s, objs, arms):
+    """BVH per mesh of the outfit as it is on the base: the meshes being fitted, and any
+    other mesh on the same armatures (a shoe left out of Layers still hides a sock's toe)."""
+    bodies = {s.source_body, s.target_body}
+    meshes = [o for o in context.scene.objects
+              if o.type == 'MESH' and o not in bodies and not is_result(o)
+              and (o in objs or set(deforming_armatures(o)) & set(arms))]
+    dg = context.evaluated_depsgraph_get()
+    out = {}
+    for o in meshes:
+        verts, tris, _edges = mu.evaluated_mesh_world(o, dg)
+        if len(tris):
+            out[o] = mu.build_bvh(verts, tris)
+    return out
+
+
 def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_feet,
-                field_for, align_of, arms, arm_map, coll, progress):
+                field_for, align_of, arms, arm_map, coll, progress, limbs_for=lambda o: None, notes=None):
     body_verts, tt, te = mu.evaluated_mesh_world(s.target_body, context.evaluated_depsgraph_get())
     body_normals = mu.vertex_normals(body_verts, tt)
     # Avatars often have hair, accessories or clothing merged into the body mesh. Only the
@@ -1014,7 +1216,7 @@ def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_fee
     skin = body_parts(body_verts, te, field_for(align_of(objs[0])).bvh_fitted)
     tt = tt[skin[tt].all(1)]
     body_bvh = mu.build_bvh(body_verts, tt)
-    body = (body_verts[skin], body_normals[skin], body_bvh)
+    body = (body_verts[skin], body_normals[skin], body_bvh, SmoothSide(body_verts, tt, body_normals))
 
     # Shoes are placed first, sized to cover the target's feet. Layers listed before a shoe
     # (socks, stockings) are then tucked inside it rather than the shoe growing around them.
@@ -1023,16 +1225,19 @@ def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_fee
         verts, tris, edges, _unposed = shoe_shapes[o]
         placed[o] = place_shoes(verts, tris, edges, src_feet[o], tgt_feet, body[:2])
 
+    covers = _outfit_meshes(context, s, objs, arms)
     layers = []
     results = []
     for i, o in enumerate(objs):
+        info = {}
         if o in shoes:
             verts, tris, edges, unposed = shoe_shapes[o]
             fitted = placed[o]
         else:
             verts, tris, edges, unposed = evaluated_shape(context, o)
             fitted = fit_points(o, verts, tris, edges, field_for(align_of(o)), s, *solvers[o], body,
-                                layers if s.collide_layers else ())
+                                layers if s.collide_layers else (), info,
+                                [bvh for c, bvh in covers.items() if c is not o], limbs_for(o))
             outer_shoes = [mu.build_bvh(placed[sh], shoe_shapes[sh][1]) for sh in shoes if objs.index(sh) > i]
             if outer_shoes:
                 fitted = tuck_in(fitted, tris, outer_shoes, body_bvh, s.collision_offset)
@@ -1048,6 +1253,11 @@ def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_fee
         if new.parent in arm_map and new.parent_type in {'OBJECT', 'ARMATURE'}:
             new.parent = arm_map[new.parent]
         write_positions(new, mu.transform_points(o.matrix_world.inverted(), fitted), unposed)
+        mark_hidden(new, info.get("hidden"))
+        if notes is not None and "poked" in info:
+            note = _poke_note(o, *info["poked"])
+            if note:
+                notes.append(note)
 
         layers.append(Layer(None if o in shoes else verts, fitted, tris))
         results.append(new)

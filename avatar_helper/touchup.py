@@ -6,10 +6,12 @@ fit, so bumps, wobble and crumpled edges go, while the rest of the garment stays
 holds the restored part in place. Much quicker than straightening a hem with proportional
 editing, and it ends up looking like the original because it is the original's shape.
 """
+import os
+
 import bpy
 import numpy as np
 
-from . import elastic
+from . import calibration, conversions, elastic, fitting
 from . import mesh_utils as mu
 
 
@@ -56,42 +58,66 @@ def falloff_weights(selected, edges, rest, falloff):
     return w * w * (3.0 - 2.0 * w)
 
 
-def restore_shape(context, obj, coords, selected, tris, edges, scale, falloff, body=None, min_gap=0.002):
+def restore_shape(context, obj, coords, selected, tris, edges, scale, falloff, body=None, min_gap=0.002,
+                  leave_hidden=True):
     """New local positions for the fitted mesh `obj` (currently at `coords`), with the
     `selected` vertices rebuilt from the original garment. If `body` (a mesh object) is
-    given, points that were outside it stay outside, by up to `min_gap`."""
+    given, the result is kept outside it, by each point's gap up to `min_gap`, except for the
+    parts the fit kept inside the body by design (a tucked-in hem), which stay as fitted
+    unless `leave_hidden` is off."""
     rest = original_shape(obj)
+    if len(rest) != len(coords):
+        raise ValueError(f"'{obj.name}' has {len(coords)} vertices, its original {len(rest)}: "
+                         "the shape can only be restored on the mesh as fitted")
     weight = falloff_weights(selected, edges, rest, falloff)
     push = None
     if body is not None:
-        push, inside = _keep_outside(context, obj, coords, body, min_gap)
-        # Parts tucked inside the body (hidden by design) stay as fitted.
-        weight[inside] = 0.0
+        push, hidden = _keep_outside(context, obj, coords, body, min_gap, leave_hidden)
+        weight[hidden] = 0.0
     return elastic.restore_shape(rest, coords, tris, edges, weight, scale, push)
 
 
-def _keep_outside(context, obj, coords, body, min_gap, depth=0.02):
-    """push(x) keeping points that were outside the body outside it, and which points are
-    inside it now."""
+def _body_surface(context, body):
+    """The avatar's body to keep clothing out of: only its body parts, not hair or accessories
+    merged into the mesh, when the scene's conversion is there to tell them apart."""
+    verts, tris, edges = mu.evaluated_mesh_world(body, context.evaluated_depsgraph_get())
+    s = context.scene.avatar_helper
+    path = conversions.path_for(s.conversion) if s.conversion else ""
+    arm = calibration.target_armature(s) if body == s.target_body else None
+    if path and os.path.exists(path) and arm is not None:
+        conv = conversions.Conversion.load(path)
+        fitted = mu.transform_points(conv.target_alignment(arm), conv.fitted)
+        keep = fitting.body_parts(verts, edges, mu.build_bvh(fitted, conv.tris))
+        tris = tris[keep[tris].all(1)]
+    return mu.build_bvh(verts, tris)
+
+
+def _keep_outside(context, obj, coords, body, min_gap, leave_hidden=True, depth=fitting.BODY_DEPTH):
+    """push(x) keeping the garment outside the body, and which points to leave alone: the
+    parts the fit kept inside the body by design. Points that are inside the body for any
+    other reason (squeezed in by the fit) are restored and pushed back out to Min Gap.
+    For meshes fitted before this was recorded, every point inside the body is left alone."""
     mw = np.array(obj.matrix_world)
     inv = np.linalg.inv(mw[:3, :3])
-    bv, bt, _ = mu.evaluated_mesh_world(body, context.evaluated_depsgraph_get())
-    bvh = mu.build_bvh(bv, bt)
+    bvh = _body_surface(context, body)
 
     def side(points):
         loc, nrm, idx, _dist = mu.nearest_on(bvh, points, depth)
         return np.where(idx >= 0, ((points - loc) * nrm).sum(1), np.inf), loc, nrm
 
     before, _loc, _nrm = side(mu.transform_points(mw, coords))
-    clear = np.clip(before, 0.0, min_gap)  # each point's own gap, up to Min Gap
-    was_outside = before >= 0.0  # points already inside (tucked in on purpose) are left alone
+    marks = fitting.hidden_marks(obj)
+    hidden = marks if marks is not None else before < 0.0
+    if not leave_hidden:
+        hidden = np.zeros(len(coords), dtype=bool)
+    clear = np.where(before >= 0.0, np.clip(before, 0.0, min_gap), min_gap)  # own gap, up to Min Gap
 
     def push(x):
         xw = mu.transform_points(mw, x)
         now, loc, nrm = side(xw)
-        need = was_outside & np.isfinite(now) & (now < clear)
+        need = ~hidden & np.isfinite(now) & (now < clear)
         out = np.zeros_like(x)
         out[need] = (loc[need] + nrm[need] * clear[need, None] - xw[need]) @ inv.T
         return out
 
-    return push, ~was_outside
+    return push, hidden

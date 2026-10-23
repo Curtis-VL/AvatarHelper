@@ -95,6 +95,160 @@ def vertex_normals(verts, tris):
 
 
 
+def boundary_loops(tris):
+    """Open-edge loops of a triangle mesh, each as vertex indices in the order its triangles
+    run along it. Edges that don't close into a simple loop are left out."""
+    directed = np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]])
+    have = set(map(tuple, directed.tolist()))
+    nxt = {}
+    for a, b in directed.tolist():
+        if (b, a) not in have:
+            nxt.setdefault(a, []).append(b)
+    loops, seen = [], set()
+    for start in list(nxt):
+        if start in seen or len(nxt[start]) != 1:
+            continue
+        loop, v = [start], nxt[start][0]
+        while v != start and v not in seen and len(nxt.get(v, ())) == 1 and len(loop) <= len(nxt):
+            loop.append(v)
+            v = nxt[v][0]
+        seen.update(loop)
+        if v == start and len(loop) >= 3:
+            loops.append(np.array(loop, dtype=np.int64))
+    return loops
+
+
+def weld_map(verts, tris, dist):
+    """Per vertex, the vertex it would be merged with: open-edge vertices of separate pieces
+    lying within `dist` of each other (a leg modelled as its own part, its top edge on the
+    hip's) count as one, so their seam isn't taken for a hole."""
+    from mathutils.kdtree import KDTree
+    rep = np.arange(len(verts))
+    e = np.sort(np.concatenate([tris[:, [0, 1]], tris[:, [1, 2]], tris[:, [2, 0]]]), axis=1)
+    u, c = np.unique(e, axis=0, return_counts=True)
+    rim = np.unique(u[c == 1])
+    if not len(rim):
+        return rep
+    kd = KDTree(len(rim))
+    for i in rim.tolist():
+        kd.insert(verts[i].tolist(), i)
+    kd.balance()
+    for i in rim.tolist():
+        for _co, j, _d in kd.find_range(verts[i].tolist(), dist):
+            a, b = rep[i], rep[j]
+            while rep[a] != a:
+                a = rep[a]
+            while rep[b] != b:
+                b = rep[b]
+            if a != b:
+                rep[max(a, b)] = min(a, b)
+    for i in range(len(rep)):
+        r = rep[i]
+        while rep[r] != r:
+            r = rep[r]
+        rep[i] = r
+    return rep
+
+
+def hole_patches(verts, tris, max_perimeter=1.5, allowed=None, weld=0.0):
+    """Patches closing the holes of a mesh (a base with an opening at the crotch, fingertips
+    left open under separate nails, a neck under a separate head): new vertices, and
+    triangles indexing the mesh's vertices followed by the new ones. Each patch is a smooth
+    membrane across its hole, wound to face the same way as the mesh around it. allowed:
+    per vertex, whether holes there may be closed (e.g. only on the body itself). weld:
+    separate pieces' open edges this close are taken as joined (see weld_map), and only
+    what is still open is closed."""
+    new_verts, new_tris = [], []
+    n = len(verts)
+    if weld > 0.0:
+        tris = weld_map(verts, tris, weld)[tris]
+        tris = tris[(tris[:, 0] != tris[:, 1]) & (tris[:, 1] != tris[:, 2]) & (tris[:, 2] != tris[:, 0])]
+    for loop in boundary_loops(tris):
+        if allowed is not None and not allowed[loop].all():
+            continue
+        rim = verts[loop]
+        k = len(loop)
+        perimeter = float(np.linalg.norm(rim - np.roll(rim, -1, axis=0), axis=1).sum())
+        if perimeter > max_perimeter:
+            continue
+        step = perimeter / k
+        rings = int(np.clip(round(perimeter / (2.0 * np.pi) / max(step, 1e-6)), 1, 12))
+        centre = rim.mean(0)
+        start = n + sum(len(v) for v in new_verts)
+        pts = [rim + (centre - rim) * (r / rings) for r in range(1, rings)] + [centre[None]]
+        ids = [loop] + [start + r * k + np.arange(k) for r in range(rings - 1)]
+        centre_id = start + (rings - 1) * k
+        tri = []
+        for r in range(rings - 1):
+            a, b = ids[r], ids[r + 1]
+            for i in range(k):
+                j = (i + 1) % k
+                # The mesh runs along the rim a[i] -> a[j]; the patch, beside it, runs back.
+                tri += [(a[j], a[i], b[i]), (a[j], b[i], b[j])]
+        last = ids[-1]
+        tri += [(last[(i + 1) % k], last[i], centre_id) for i in range(k)]
+        patch = np.concatenate(pts)
+        tri = np.array(tri, dtype=np.int64)
+        # Relax the inside of the patch into a smooth membrane, its rim held in place.
+        local = np.concatenate([rim, patch])
+        lt = np.where(tri >= start, tri - start + k, -1)
+        rim_pos = {int(v): i for i, v in enumerate(loop)}
+        for c in range(3):
+            col = tri[:, c]
+            lt[col < start, c] = [rim_pos[int(v)] for v in col[col < start]]
+        e = np.sort(np.concatenate([lt[:, [0, 1]], lt[:, [1, 2]], lt[:, [2, 0]]]), axis=1)
+        adj = Adjacency(len(local), np.unique(e, axis=0))
+        for _ in range(rings * rings * 4):
+            local[k:] = adj.neighbor_mean(local)[k:]
+        new_verts.append(local[k:])
+        new_tris.append(tri)
+    if not new_verts:
+        return np.zeros((0, 3)), np.zeros((0, 3), dtype=np.int64)
+    return np.concatenate(new_verts), np.concatenate(new_tris)
+
+
+def fill_creases(verts, tris, width, passes=8):
+    """The surface with creases narrower than about `width` filled in, the way fabric
+    stretched over it would bridge them (between toes, in a crotch, a navel). Points only
+    ever move outwards, onto the average of the surface around them, so bumps and convex
+    shapes stay as they are."""
+    from mathutils.kdtree import KDTree
+    if width <= 0.0 or not len(verts):
+        return verts.copy()
+    # The surface around each point is averaged from a coarser copy of it (points merged
+    # in small cells), found once: the filling moves points by much less than `width`.
+    cell = width / 6.0
+    _, inv, counts = np.unique(np.floor(verts / cell).astype(np.int64), axis=0, return_inverse=True,
+                               return_counts=True)
+    inv = inv.ravel()
+    m = len(counts)
+
+    def coarse(points):
+        return np.stack([np.bincount(inv, points[:, c], m) for c in range(3)], 1) / counts[:, None]
+
+    kd = KDTree(m)
+    for i, p in enumerate(coarse(verts).tolist()):
+        kd.insert(p, i)
+    kd.balance()
+    rows, cols, dists = [], [], []
+    for i, p in enumerate(verts.tolist()):
+        hits = kd.find_range(p, width)
+        rows.append(np.full(len(hits), i, dtype=np.int64))
+        cols.append(np.fromiter((h[1] for h in hits), dtype=np.int64, count=len(hits)))
+        dists.append(np.fromiter((h[2] for h in hits), dtype=np.float64, count=len(hits)))
+    rows, cols, dists = np.concatenate(rows), np.concatenate(cols), np.concatenate(dists)
+    w = np.exp(-dists ** 2 / (0.5 * width) ** 2) * counts[cols]
+    total = np.maximum(np.bincount(rows, weights=w, minlength=len(verts)), 1e-12)
+    out = verts.copy()
+    for _ in range(passes):
+        normals = vertex_normals(out, tris)
+        c = coarse(out)
+        mean = np.stack([np.bincount(rows, weights=w * c[cols, k], minlength=len(verts)) for k in range(3)], 1)
+        lift = ((mean / total[:, None] - out) * normals).sum(1)
+        out = out + np.maximum(lift, 0.0)[:, None] * normals
+    return out
+
+
 def barycentric(p, a, b, c):
     v0, v1, v2 = b - a, c - a, p - a
     d00 = (v0 * v0).sum(1)

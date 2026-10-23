@@ -8,11 +8,13 @@ Sliding that key from 0 to 1 morphs the source body onto the target, and the key
 sculpted by hand to fix problem areas, then saved again.
 """
 import json
+import re
 
+import bmesh
 import bpy
 import numpy as np
 
-from . import conversions
+from . import bone_map, conversions
 from . import mesh_utils as mu
 from . import rig
 from .rbf import RBFWarp, dedupe_pairs
@@ -141,6 +143,10 @@ def _reverse_pull(warped, tris, normals, tgt_verts, tgt_normals, tgt_labels, s):
         return num, den
     t = tris[idx[ok]]
     bary = mu.barycentric(loc[ok], warped[t[:, 0]], warped[t[:, 1]], warped[t[:, 2]])
+    # A point just outside its triangle (rounding) gets slightly negative shares, which can
+    # cancel to nearly nothing and blow the averaged pull up; keep the shares in 0..1.
+    bary = np.clip(bary, 0.0, None)
+    bary /= np.maximum(bary.sum(1, keepdims=True), 1e-12)
     pull = tgt_verts[ok] - loc[ok]
     for c in range(3):
         for k in range(3):
@@ -149,13 +155,89 @@ def _reverse_pull(warped, tris, normals, tgt_verts, tgt_normals, tgt_labels, s):
     return num, den
 
 
-def _uncovered(warped, tris, tgt_verts, tgt_labels, gap=0.005):
+def _part_name(key):
+    """'index_2.L' -> 'index finger (left)', 'upper_arm.R' -> 'upper arm (right)'."""
+    side = {"L": " (left)", "R": " (right)"}.get(key.rsplit(".", 1)[-1], "") if "." in key else ""
+    name = re.sub(r"_\d$", "", key.split(".")[0])
+    if name in bone_map.FINGER_NAMES and name != "thumb":
+        name += " finger"
+    return name.replace("_", " ") + side
+
+
+def _uncovered(warped, tris, tgt_verts, tgt_labels, tgt_arm, gap=0.005):
     """Share of the target body that the matched source body doesn't reach (further than
-    `gap`): a big unmatched shape shows up here, not in the source-to-target error."""
+    `gap`), and the part of the body most of that is around (e.g. "head" when the base's head
+    is a separate mesh). A big unmatched shape shows up here, not in the source-to-target error."""
     _loc, _nrm, idx, dist = mu.nearest_on(mu.build_bvh(warped, tris), tgt_verts, 0.2)
     dist = np.where(idx >= 0, dist, np.inf)
     body = _body_parts(tgt_verts, tgt_labels, dist)
-    return float((dist[body] > gap).mean()) if body.any() else 0.0
+    if not body.any():
+        return 0.0, ""
+    missed = body & (dist > gap)
+    where = ""
+    joints = rig.joint_positions(tgt_arm, rig.armature_map(tgt_arm)) if tgt_arm is not None and missed.any() else {}
+    if joints:
+        keys = list(joints)
+        pts = np.array([joints[k][:] for k in keys])
+        nearest = np.argmin(np.linalg.norm(tgt_verts[missed][:, None, :] - pts[None], axis=2), axis=1)
+        top = np.bincount(nearest, minlength=len(keys)).argmax()
+        where = _part_name(keys[top])
+    return float(missed[body].mean()), where
+
+
+HOLE_WELD = 0.001  # separate pieces of a body whose edges are this close count as joined
+
+
+def _main_part(verts, tris):
+    """Per vertex, whether it is on the body itself: the mesh's largest part, counting pieces
+    joined at a seam (a leg modelled separately) as one."""
+    rep = mu.weld_map(verts, tris, HOLE_WELD)
+    t = rep[tris]
+    edges = np.concatenate([t[:, [0, 1]], t[:, [1, 2]], t[:, [2, 0]], np.stack([np.arange(len(rep)), rep], 1)])
+    labels = mu.islands(len(verts), edges)
+    return labels == np.argmax(np.bincount(labels))
+
+
+OPEN_BY_DESIGN = ("neck", "head")  # a body open here is waiting for its separate head mesh
+
+
+def _fillable(verts, tris, arm):
+    """Per vertex, whether a hole there should be closed: on the body itself, and not at the
+    neck, where a base often ends for its head, modelled as a separate mesh, to sit on."""
+    ok = _main_part(verts, tris)
+    if arm is None:
+        return ok
+    joints = rig.joint_positions(arm, rig.armature_map(arm))
+    if not any(k in joints for k in OPEN_BY_DESIGN):
+        return ok
+    keys = list(joints)
+    pts = np.array([joints[k][:] for k in keys])
+    nearest = np.empty(len(verts), dtype=np.int64)
+    for start in range(0, len(verts), 4096):
+        chunk = verts[start:start + 4096]
+        nearest[start:start + 4096] = np.argmin(((chunk[:, None, :] - pts[None]) ** 2).sum(2), axis=1)
+    by_design = np.isin(np.array(keys, dtype=object)[nearest], OPEN_BY_DESIGN)
+    return ok & ~by_design
+
+
+def _append_faces(me, verts, tris):
+    """Add vertices and triangles (indexing the mesh's vertices, then the new ones) to a mesh."""
+    bm = bmesh.new()
+    bm.from_mesh(me)
+    bm.verts.ensure_lookup_table()
+    first = len(bm.verts)
+    for p in verts.tolist():
+        bm.verts.new(p)
+    bm.verts.ensure_lookup_table()
+    for t in tris.tolist():
+        try:
+            bm.faces.new([bm.verts[i] for i in t])
+        except ValueError:  # already there
+            pass
+    bm.to_mesh(me)
+    bm.free()
+    me.update()
+    assert len(me.vertices) == first + len(verts)
 
 
 def calibrate(context, s, progress=None):
@@ -179,11 +261,26 @@ def calibrate(context, s, progress=None):
     cal["ah_target"] = tgt_body.name
 
     base, tris, edges = mu.mesh_arrays(me)
-    tgt_verts, tgt_tris, _ = mu.evaluated_mesh_world(tgt_body, dg)
+    n_body = len(base)
+    # Holes in either body (an opening at the crotch, fingertips open under separate nails)
+    # are closed for the matching. Otherwise there's no surface there for clothing to follow,
+    # and shorts made over the base's opening go into the avatar's body where it has none.
+    src_arm, tgt_arm = source_armature(s), target_armature(s)
+    patch_verts, patch_tris = mu.hole_patches(base, tris, allowed=_fillable(base, tris, src_arm), weld=HOLE_WELD)
+    if len(patch_verts):
+        _append_faces(me, patch_verts, patch_tris)
+        base, tris, edges = mu.mesh_arrays(me)
+    tgt_verts, tgt_tris, tgt_edges = mu.evaluated_mesh_world(tgt_body, dg)
+    patch_verts, patch_tris = mu.hole_patches(tgt_verts, tgt_tris, allowed=_fillable(tgt_verts, tgt_tris, tgt_arm),
+                                              weld=HOLE_WELD)
+    if len(patch_verts):
+        tgt_verts = np.concatenate([tgt_verts, patch_verts])
+        tgt_tris = np.concatenate([tgt_tris, patch_tris])
+        tgt_edges = np.unique(np.sort(np.concatenate([tgt_tris[:, [0, 1]], tgt_tris[:, [1, 2]],
+                                                      tgt_tris[:, [2, 0]]]), axis=1), axis=0)
 
     # Stage 1: coarse warp from matching joints and user landmarks.
     pairs = []
-    src_arm, tgt_arm = source_armature(s), target_armature(s)
     tips = []
     if src_arm and tgt_arm:
         pairs += joint_pairs(src_arm, tgt_arm)
@@ -205,7 +302,6 @@ def calibrate(context, s, progress=None):
     # around its base, and its front is left uncovered.
     bvh = mu.build_bvh(tgt_verts, tgt_tris)
     tgt_normals = mu.vertex_normals(tgt_verts, tgt_tris)
-    tgt_edges = mu.evaluated_mesh_world(tgt_body, dg)[2]
     tgt_labels = mu.islands(len(tgt_verts), tgt_edges)
     adj = mu.Adjacency(len(base), edges)
     iters = max(1, s.icp_iterations)
@@ -221,14 +317,18 @@ def calibrate(context, s, progress=None):
         rnum, rden = _reverse_pull(warped, tris, normals, tgt_verts, tgt_normals, tgt_labels, s)
         num += rnum
         den += rden
-        residual = num / np.maximum(den, 1e-9)[:, None]
-        warped += adj.solve_membrane(residual, np.minimum(den, 1.0), stiffness)
+        # Points with barely any pull on them (a corner just touched by a reverse match) are
+        # left to follow their neighbours, rather than given a pull divided by almost nothing.
+        has = den > 1e-3
+        residual = np.where(has[:, None], num / np.maximum(den, 1e-3)[:, None], 0.0)
+        warped += adj.solve_membrane(residual, np.where(has, np.minimum(den, 1.0), 0.0), stiffness)
         if progress:
             progress((it + 1) / iters)
 
     _loc, _nrm, idx, dist = mu.nearest_on(bvh, warped, 1.0)
     dist = np.where(idx >= 0, dist, 1.0)
-    uncovered = _uncovered(warped, tris, tgt_verts, tgt_labels)
+    body_dist = dist[:n_body]  # the patches over holes needn't land exactly
+    uncovered, uncovered_where = _uncovered(warped, tris, tgt_verts, tgt_labels, tgt_arm)
 
     cal.shape_key_add(name="Basis", from_mix=False)
     key = cal.shape_key_add(name=CALIBRATION_KEY, from_mix=False)
@@ -252,8 +352,9 @@ def calibrate(context, s, progress=None):
         "joints": len(pairs) - len(landmarks) - len(tips),
         "tips": len(tips),
         "landmarks": len(landmarks),
-        "mean_error": float(dist.mean()),
-        "p95_error": float(np.percentile(dist, 95)),
-        "max_error": float(dist.max()),
+        "mean_error": float(body_dist.mean()),
+        "p95_error": float(np.percentile(body_dist, 95)),
+        "max_error": float(body_dist.max()),
         "uncovered": uncovered,
+        "uncovered_where": uncovered_where,
     }
