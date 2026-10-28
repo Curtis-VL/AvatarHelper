@@ -4,7 +4,9 @@ The fitted copies take over the originals' names (Unity animations and toggles r
 objects by name) and their place in the scene's collections; the originals are renamed
 "<name> (original)" and moved to a hidden collection, still there to fit again. Finalized
 results are no longer touched by later fits, so you can go on to the next outfit, or the
-next part of this one.
+next part of this one. They can be fitted again themselves with another conversion from
+this avatar (e.g. to the same avatar with a bigger chest), but not with the one that made
+them: that would apply it twice.
 
 Optionally the clothing is rigged to the avatar's own armature (see weights.py) instead of
 the fitted outfit armature.
@@ -21,6 +23,7 @@ from .fitting import FITTED_COLLECTION, body_parts
 
 ORIGINALS_COLLECTION = "AH_Originals"
 ORIGINAL_SUFFIX = " (original)"
+FINAL_CONVERSION = "ah_final_conversion"  # on finalized meshes: the conversion they were fitted with
 
 
 def fitted_copy(obj):
@@ -56,6 +59,7 @@ def finalize(context, s, rig_to='OUTFIT'):
     done = []
     for o, f in pairs:
         _take_over(o, f, originals)
+        f[FINAL_CONVERSION] = s.conversion
         done.append(f.name)
     for a in arms:
         if a is not None and a.get("ah_fitted_from"):

@@ -1078,6 +1078,10 @@ def fit_clothing(context, s, progress=None, notes=None):
     for item in s.clothing:
         o = item.obj
         if o and o.type == 'MESH' and o not in objs and not is_result(o):
+            if o.get("ah_final_conversion") == s.conversion:
+                raise ValueError(f"'{o.name}' was already fitted with '{conv.name or s.conversion}': fitting it "
+                                 f"again would apply it twice. Fit '{o.get('ah_final_from', 'the original')}' "
+                                 "instead to redo the fit")
             objs.append(o)
             solvers[o] = (s.solver if item.solver == 'DEFAULT' else item.solver,
                           item.shape_detail if item.custom_detail else s.shape_detail)

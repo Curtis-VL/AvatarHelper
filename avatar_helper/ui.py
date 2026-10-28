@@ -164,6 +164,7 @@ class AH_PT_fit(_Panel, bpy.types.Panel):
         col.prop(s, "solver", text="Solver")
         col.prop(s, "shape_detail")
         layout.operator("avatar_helper.fit", icon='MOD_CLOTH')
+        layout.operator("avatar_helper.fit_body_keys", icon='SHAPEKEY_DATA')
 
         box = layout.box()
         box.label(text="Happy with it?")

@@ -2,9 +2,9 @@ import bmesh
 import bpy
 import numpy as np
 
-from . import calibration, conversions, finalize, fitting, layers, rig, touchup, updater
+from . import body_keys, calibration, conversions, finalize, fitting, layers, rig, touchup, updater
 from .bone_map import missing_required
-from .props import is_result
+from .props import AH_BodyKey, is_result, not_clothing_reason
 
 HIGH_ERROR = 0.003  # metres; a good calibration is well under 1 mm on average
 HIGH_UNCOVERED = 0.02  # share of the target body the matched base doesn't reach
@@ -409,6 +409,101 @@ class AH_OT_fit(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _on_avatar(s):
+    """The clothing in Layers as it is on the avatar, innermost first, with each item's solver
+    and Shape Detail: its fitted copy, or the item itself when it is already the avatar's
+    (finalized, or on the avatar's armature). Also the names of items not fitted yet."""
+    tgt_arms = set(rig.deforming_armatures(s.target_body)) if s.target_body else set()
+    items, unfitted = [], []
+    for it in s.clothing:
+        if not it.obj:
+            continue
+        o = finalize.fitted_copy(it.obj)
+        if o is None and ("ah_final_from" in it.obj or set(rig.deforming_armatures(it.obj)) & tgt_arms):
+            o = it.obj
+        if o is None:
+            unfitted.append(it.obj.name)
+        elif o.type == 'MESH' and all(o is not i[0] for i in items):
+            items.append((o, s.solver if it.solver == 'DEFAULT' else it.solver,
+                          it.shape_detail if it.custom_detail else s.shape_detail))
+    return items, unfitted
+
+
+class AH_OT_fit_body_keys(bpy.types.Operator):
+    bl_idname = "avatar_helper.fit_body_keys"
+    bl_label = "Fit Body Shape Keys"
+    bl_description = ("Give the fitted clothing your avatar's body shape keys (e.g. a bigger chest): the clothing "
+                      "is fitted to the body with each key on, and saved as a shape key of the same name")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    keys: bpy.props.CollectionProperty(type=AH_BodyKey)
+    replace: bpy.props.BoolProperty(
+        name="Replace the Clothing's Own Keys",
+        description="Also replace keys the clothing already has with the same name (e.g. made by its creator)")
+
+    def _offer(self, context):
+        """Fill the list of keys to choose from. Returns an error message, or None."""
+        s = context.scene.avatar_helper
+        if not (s.target_body and s.target_body.data.shape_keys):
+            return "Set your avatar's body (with shape keys) first"
+        items, unfitted = _on_avatar(s)
+        if not items:
+            return "Fit the clothing in the list first" if unfitted else "Add clothing to the list first"
+        self.keys.clear()
+        for name, hides in body_keys.candidates(context, s.target_body, [o for o, _s, _d in items]):
+            k = self.keys.add()
+            k.name, k.hides, k.use = name, hides, not hides
+        if not self.keys:
+            return "None of your avatar's body shape keys reach the clothing"
+        return None
+
+    def invoke(self, context, _event):
+        _ensure_object_mode(context)
+        err = self._offer(context)
+        if err:
+            self.report({'ERROR'}, err)
+            return {'CANCELLED'}
+        return context.window_manager.invoke_props_dialog(self, width=420)
+
+    def draw(self, _context):
+        layout = self.layout
+        layout.label(text="Body shape keys that reach the clothing:")
+        flow = layout.grid_flow(columns=2, even_columns=True, align=True)
+        for k in self.keys:
+            flow.prop(k, "use", text=k.name, icon='HIDE_ON' if k.hides else 'NONE')
+        if any(k.hides for k in self.keys):
+            layout.label(text="Keys that seem to hide the body under clothing start unticked", icon='HIDE_ON')
+        layout.prop(self, "replace")
+
+    def execute(self, context):
+        _ensure_object_mode(context)
+        s = context.scene.avatar_helper
+        if not self.keys:  # run from a script: the keys as they'd be offered
+            err = self._offer(context)
+            if err:
+                self.report({'ERROR'}, err)
+                return {'CANCELLED'}
+        names = [k.name for k in self.keys if k.use]
+        if not names:
+            self.report({'ERROR'}, "Tick at least one shape key")
+            return {'CANCELLED'}
+        items, unfitted = _on_avatar(s)
+        with _Progress(context) as progress:
+            rep = body_keys.fit_body_keys(context, s.target_body, items, names, s, self.replace, progress)
+        made = rep["made"]
+        if made:
+            self.report({'INFO'}, "Shape keys added: " + "; ".join(f"{o}: {', '.join(k)}" for o, k in made.items()))
+        else:
+            self.report({'WARNING'}, "The ticked keys don't change the clothing; nothing added")
+        if rep["kept"]:
+            self.report({'WARNING'}, "Kept the clothing's own keys (tick Replace to redo them): "
+                        + ", ".join(f"{o} '{k}'" for o, k in rep["kept"][:6])
+                        + (f" (+{len(rep['kept']) - 6} more)" if len(rep["kept"]) > 6 else ""))
+        if unfitted:
+            self.report({'WARNING'}, "Not fitted yet, left out: " + ", ".join(unfitted))
+        return {'FINISHED'}
+
+
 class AH_OT_clothing_add(bpy.types.Operator):
     bl_idname = "avatar_helper.clothing_add"
     bl_label = "Add Selected"
@@ -418,15 +513,21 @@ class AH_OT_clothing_add(bpy.types.Operator):
     def execute(self, context):
         s = context.scene.avatar_helper
         present = {it.obj for it in s.clothing if it.obj}
-        skip = {s.source_body, s.target_body, s.calibration}
-        added = 0
+        added, skipped = 0, []
         for o in context.selected_objects:
-            if o.type == 'MESH' and o not in present and o not in skip and not is_result(o):
+            if o in present:
+                continue
+            reason = not_clothing_reason(o, s)
+            if reason is None:
                 s.clothing.add().obj = o
                 added += 1
+            elif o.type == 'MESH':
+                skipped.append(f"'{o.name}' is {reason}")
         if not added:
             s.clothing.add()
         s.clothing_index = len(s.clothing) - 1
+        if skipped:
+            self.report({'WARNING'}, "Not added: " + "; ".join(skipped))
         return {'FINISHED'}
 
 
@@ -470,6 +571,7 @@ classes = (
     AH_OT_clear_landmarks,
     AH_OT_sort_layers,
     AH_OT_fit,
+    AH_OT_fit_body_keys,
     AH_OT_update_check,
     AH_OT_update_install,
     AH_OT_report_bug,

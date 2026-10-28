@@ -22,17 +22,36 @@ SOLVERS = (
 
 
 def is_result(obj):
-    """Made by the add-on: a fitted or finalized copy, or the calibration preview."""
-    return any(k in obj for k in ("ah_fitted_from", "ah_final_from", "ah_calibration"))
+    """Work in progress made by the add-on: a fitted copy (replaced by the next fit) or the
+    calibration preview. Finalized clothing is the avatar's own now and can be fitted again,
+    e.g. to the same avatar with another body shape."""
+    return any(k in obj for k in ("ah_fitted_from", "ah_calibration"))
+
+
+def not_clothing_reason(obj, s):
+    """Why `obj` can't be in the Layers list, or None if it can."""
+    if obj.type != 'MESH':
+        return "not a mesh"
+    if "ah_fitted_from" in obj:
+        return f"a fitted copy of '{obj['ah_fitted_from']}' (finalize it, or add the original instead)"
+    if "ah_calibration" in obj:
+        return "the calibration preview"
+    if obj == s.source_body:
+        return "the base body"
+    if obj == s.target_body:
+        return "your avatar's body"
+    return None
 
 
 def _is_clothing(_self, obj):
-    s = bpy.context.scene.avatar_helper
-    return obj.type == 'MESH' and not is_result(obj) and obj not in (s.source_body, s.target_body)
+    return not_clothing_reason(obj, bpy.context.scene.avatar_helper) is None
 
 
 class AH_ClothingItem(bpy.types.PropertyGroup):
-    obj: PointerProperty(name="Object", type=bpy.types.Object, poll=_is_clothing)
+    obj: PointerProperty(
+        name="Object", type=bpy.types.Object, poll=_is_clothing,
+        description="Clothing mesh to fit. Not offered: the bodies, fitted copies (until finalized) and the "
+                    "calibration preview")
     mode: EnumProperty(
         name="Mode",
         items=(
@@ -55,6 +74,12 @@ class AH_ClothingItem(bpy.types.PropertyGroup):
         name="Shape Detail", default=0.05, min=0.002, soft_max=0.1, subtype='DISTANCE', unit='LENGTH',
         description="Shape-preserving solver: detail smaller than this comes from the original garment, "
                     "larger shape changes follow the target")
+
+
+class AH_BodyKey(bpy.types.PropertyGroup):
+    """One of the body's shape keys offered by Fit Body Shape Keys (`name` is the key's)."""
+    use: BoolProperty(name="Use", default=True)
+    hides: BoolProperty(name="Hides the Body")
 
 
 def _show_calibration(self, _context):
@@ -176,7 +201,7 @@ class AH_Preferences(bpy.types.AddonPreferences):
         updater.draw(box)
 
 
-classes = (AH_ClothingItem, AH_Settings, AH_Preferences)
+classes = (AH_ClothingItem, AH_BodyKey, AH_Settings, AH_Preferences)
 
 
 def register():
