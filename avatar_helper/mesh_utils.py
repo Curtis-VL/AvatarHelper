@@ -249,6 +249,23 @@ def fill_creases(verts, tris, width, passes=8):
     return out
 
 
+def falloff_weights(selected, edges, rest, falloff):
+    """1 on the selection, fading to 0 over `falloff` along the surface."""
+    w = selected.astype(np.float64)
+    if falloff <= 0.0 or not len(edges):
+        return w
+    edge_len = float(np.median(np.linalg.norm(rest[edges[:, 0]] - rest[edges[:, 1]], axis=1)))
+    rings = max(1, int(round(falloff / max(edge_len, 1e-5))))
+    e0, e1 = edges[:, 0], edges[:, 1]
+    for _ in range(rings):
+        grown = w.copy()
+        np.maximum.at(grown, e0, w[e1] - 1.0 / rings)
+        np.maximum.at(grown, e1, w[e0] - 1.0 / rings)
+        w = np.maximum(grown, 0.0)
+    # Smooth ramp rather than a linear one, so the border doesn't show as a crease.
+    return w * w * (3.0 - 2.0 * w)
+
+
 def barycentric(p, a, b, c):
     v0, v1, v2 = b - a, c - a, p - a
     d00 = (v0 * v0).sum(1)

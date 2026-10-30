@@ -11,10 +11,10 @@ bl_info = {
 if "bpy" in locals():
     # F3 > Reload Scripts: reload in dependency order.
     import importlib
-    for _m in (bone_map, mesh_utils, rbf, rig, conversions, calibration, updater, props, elastic, limbs, fitting, body_keys, touchup, weights, finalize, layers, operators, ui):  # noqa: F821
+    for _m in (bone_map, mesh_utils, rbf, slide, rig, conversions, calibration, updater, props, elastic, limbs, anchors, fitting, body_keys, touchup, weights, finalize, layers, operators, ui):  # noqa: F821
         importlib.reload(_m)
 else:
-    from . import bone_map, mesh_utils, rbf, rig, conversions, calibration, updater, props, elastic, limbs, fitting, body_keys, touchup, weights, finalize, layers, operators, ui
+    from . import bone_map, mesh_utils, rbf, slide, rig, conversions, calibration, updater, props, elastic, limbs, anchors, fitting, body_keys, touchup, weights, finalize, layers, operators, ui
 
 import bpy  # noqa: E402
 

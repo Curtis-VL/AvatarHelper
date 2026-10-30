@@ -9,7 +9,8 @@ Clothing is never projected onto the body. Instead:
   * parts hidden inside the source body, or tucked under a lower layer, stay that way;
   * small disconnected parts (buttons, buckles) and the "AH_Rigid" vertex group move rigidly;
   * a push-out pass only ever moves vertices outward, away from the body and lower layers;
-  * shoes are not warped at all: they are placed rigidly on the target's feet and floor.
+  * shoes are not warped at all: they are placed rigidly on the target's feet and floor;
+  * anchors (anchors.py) slide the body mapping where a part should end up elsewhere.
 """
 import math
 import os
@@ -22,10 +23,11 @@ from mathutils import Matrix, Vector
 from mathutils.kdtree import KDTree
 
 from . import mesh_utils as mu
-from . import conversions, elastic, limbs, rig
+from . import anchors, conversions, elastic, limbs, rig
 from .calibration import CALIBRATION_KEY, output_collection, shape_key_values, target_armature
 from .props import is_result
 from .rbf import RBFWarp
+from .slide import SkinWalker
 from .rig import armature_map, bone_depth, deforming_armatures
 
 FITTED_COLLECTION = "AH_Fitted"
@@ -102,12 +104,14 @@ class FitField(SurfaceBinding):
         self.rbf = RBFWarp(centers, values, smoothing)
 
     @classmethod
-    def from_conversion(cls, conv, src_align, tgt_align, resolution, smoothing, crease_width=0.0):
+    def from_conversion(cls, conv, src_align, tgt_align, resolution, smoothing, crease_width=0.0, anchored=()):
         """The conversion placed in this scene: its source side on the clothing's armature,
         its target side on the target avatar. The warp is sampled in the conversion's own
-        frame, so where the clothing stands doesn't change it."""
+        frame, so where the clothing stands doesn't change it. `anchored`: anchors to apply
+        (from anchors.prepare)."""
         unit = float(np.cbrt(abs(np.linalg.det(src_align[:3, :3]))))
-        return cls(mu.transform_points(src_align, conv.base), mu.transform_points(tgt_align, conv.fitted),
+        fitted = anchors.apply(mu.transform_points(tgt_align, conv.fitted), conv.tris, anchored)
+        return cls(mu.transform_points(src_align, conv.base), fitted,
                    conv.tris, resolution, smoothing, grid=conv.base, grid_unit=unit, crease_width=crease_width)
 
     @classmethod
@@ -1102,12 +1106,15 @@ def fit_clothing(context, s, progress=None, notes=None):
     src_align = {a: conv.source_alignment(a) for a in arms}
     default_align = next(iter(src_align.values()), np.eye(4))
     fields = {}
+    anchored = []
 
-    def field_for(align):
-        key = tuple(np.round(align, 5).ravel())
+    def field_for(align, use_anchors=True):
+        """The fit for clothing on an armature at `align`. Without anchors for the fitted
+        armatures: an anchor moves where a part of the clothing goes, not the bones."""
+        key = (tuple(np.round(align, 5).ravel()), use_anchors and bool(anchored))
         if key not in fields:
             fields[key] = FitField.from_conversion(conv, align, tgt_align, s.field_resolution, s.field_smoothing,
-                                                   CREASE_WIDTH)
+                                                   CREASE_WIDTH, anchored if use_anchors else ())
         return fields[key]
 
     def align_of(o):
@@ -1131,6 +1138,10 @@ def fit_clothing(context, s, progress=None, notes=None):
     try:
         for a in arms:
             conv.apply_pose(context, a, src_align[a])
+        prepared, anchor_notes = anchors.prepare(context, [o for o in objs if o not in shoes], conv, align_of,
+                                                 tgt_align)
+        anchored.extend(prepared)
+        notes.extend(anchor_notes)
 
         # Shoes are taken as designed: the rest pose, before pose matching changed it.
         shoe_shapes, src_feet, tgt_feet = {}, {}, {}
@@ -1160,9 +1171,9 @@ def fit_clothing(context, s, progress=None, notes=None):
             return lf if lf is not None and lf.any() else None
 
         coll = output_collection(context.scene, FITTED_COLLECTION)
-        arm_map = {a: fit_armature(context, a, field_for(src_align[a]), coll) for a in arms}
+        arm_map = {a: fit_armature(context, a, field_for(src_align[a], use_anchors=False), coll) for a in arms}
         return _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_feet,
-                           field_for, align_of, arms, arm_map, coll, progress, limbs_for, notes)
+                           field_for, align_of, arms, arm_map, coll, progress, limbs_for, notes, anchored)
     finally:
         for pb, m in saved_pose:
             pb.matrix_basis = m
@@ -1210,7 +1221,8 @@ def _outfit_meshes(context, s, objs, arms):
 
 
 def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_feet,
-                field_for, align_of, arms, arm_map, coll, progress, limbs_for=lambda o: None, notes=None):
+                field_for, align_of, arms, arm_map, coll, progress, limbs_for=lambda o: None, notes=None,
+                anchored=()):
     body_verts, tt, te = mu.evaluated_mesh_world(s.target_body, context.evaluated_depsgraph_get())
     body_normals = mu.vertex_normals(body_verts, tt)
     # Avatars often have hair, accessories or clothing merged into the body mesh. Only the
@@ -1221,6 +1233,7 @@ def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_fee
     tt = tt[skin[tt].all(1)]
     body_bvh = mu.build_bvh(body_verts, tt)
     body = (body_verts[skin], body_normals[skin], body_bvh, SmoothSide(body_verts, tt, body_normals))
+    walker = SkinWalker(body_verts, tt) if anchored else None
 
     # Shoes are placed first, sized to cover the target's feet. Layers listed before a shoe
     # (socks, stockings) are then tucked inside it rather than the shoe growing around them.
@@ -1242,6 +1255,8 @@ def _fit_meshes(context, s, objs, shoes, solvers, shoe_shapes, src_feet, tgt_fee
             fitted = fit_points(o, verts, tris, edges, field_for(align_of(o)), s, *solvers[o], body,
                                 layers if s.collide_layers else (), info,
                                 [bvh for c, bvh in covers.items() if c is not o], limbs_for(o))
+            if anchored:
+                fitted = anchors.settle(o, verts, fitted, edges, anchored, field_for(align_of(o)), walker)
             outer_shoes = [mu.build_bvh(placed[sh], shoe_shapes[sh][1]) for sh in shoes if objs.index(sh) > i]
             if outer_shoes:
                 fitted = tuck_in(fitted, tris, outer_shoes, body_bvh, s.collision_offset)

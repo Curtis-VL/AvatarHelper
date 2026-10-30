@@ -1,8 +1,10 @@
 import bmesh
 import bpy
 import numpy as np
+from bpy_extras import view3d_utils
+from mathutils import Vector
 
-from . import body_keys, calibration, conversions, finalize, fitting, layers, rig, touchup, updater
+from . import anchors, body_keys, calibration, conversions, finalize, fitting, layers, rig, touchup, updater
 from .bone_map import missing_required
 from .props import AH_BodyKey, is_result, not_clothing_reason
 
@@ -330,6 +332,252 @@ class AH_OT_restore_shape(bpy.types.Operator):
         return {'FINISHED'}
 
 
+def _is_fitted(o):
+    return o.type == 'MESH' and ("ah_fitted_from" in o or "ah_final_from" in o)
+
+
+def _edit_arrays(obj):
+    """The edit mesh of `obj` with its local positions, selection and edges."""
+    bm = bmesh.from_edit_mesh(obj.data)
+    bm.verts.ensure_lookup_table()
+    bm.verts.index_update()
+    coords = np.array([v.co[:] for v in bm.verts]).reshape(-1, 3)
+    selected = np.array([v.select for v in bm.verts], dtype=bool)
+    edges = np.array([[e.verts[0].index, e.verts[1].index] for e in bm.edges], dtype=np.int64).reshape(-1, 2)
+    return bm, coords, selected, edges
+
+
+class AH_OT_slide_along_body(bpy.types.Operator):
+    bl_idname = "avatar_helper.slide_along_body"
+    bl_label = "Slide Along Body"
+    bl_description = ("Drag the selected part of a fitted garment over your avatar's skin (e.g. a band down over a "
+                      "breast, a stocking top down a thigh). It keeps its distance from the body rather than sinking "
+                      "in or lifting off. Z: up and down only, Shift: precise")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    offset: bpy.props.FloatVectorProperty(
+        name="Offset", size=3, subtype='TRANSLATION', unit='LENGTH',
+        description="How far to slide (world space). The selection follows the skin, so it goes along the body "
+                    "this far in this direction")
+    falloff: bpy.props.FloatProperty(
+        name="Falloff", default=0.03, min=0.0, soft_max=0.2, subtype='DISTANCE', unit='LENGTH',
+        description="The garment around the selection goes along, less and less over this distance")
+    keep_outside: bpy.props.BoolProperty(
+        name="Keep Outside Body", default=True,
+        description="Push out of the body whatever the stretching around the selection presses into it")
+    save_anchor: bpy.props.BoolProperty(
+        name="Keep for Next Fit", default=True,
+        description="Also add an anchor (see Anchors under Fit Clothing), so fitting again puts the part here too, "
+                    "with everything over or under it. Undo doesn't remove it: delete it from the Anchors list")
+    anchor: bpy.props.StringProperty(options={'HIDDEN', 'SKIP_SAVE'})
+
+    @classmethod
+    def poll(cls, context):
+        return context.mode == 'EDIT_MESH' and any(_is_fitted(o) for o in context.objects_in_mode)
+
+    def _prepare(self, context):
+        s = context.scene.avatar_helper
+        if not s.target_body:
+            raise ValueError("Set your avatar's body first")
+        walker = touchup.slide_walker(context, s.target_body)
+        self._states = []
+        for o in context.objects_in_mode:
+            if not _is_fitted(o):
+                continue
+            bm, coords, selected, edges = _edit_arrays(o)
+            if not selected.any():
+                continue
+            push = None
+            if self.keep_outside:
+                push, _hidden = touchup.outside_push(context, o, coords, s.target_body, s.collision_offset,
+                                                     bvh=walker.bvh)
+            self._states.append((bm, touchup.SlideAlongBody(o, coords, selected, edges, self.falloff, walker, push)))
+        if not self._states:
+            raise ValueError("Select the part of the fitted garment to slide first")
+
+    def _apply(self, offset):
+        """Slide every selection by `offset`, or put them back as they were (None)."""
+        for bm, st in self._states:
+            new = st.coords if offset is None else st.moved(offset)
+            for i in np.nonzero(st.moving)[0].tolist():
+                bm.verts[i].co = new[i]
+            bmesh.update_edit_mesh(st.obj.data)
+
+    def _save_anchor(self, context):
+        """Record the slide as an anchor on the active garment (one is enough: an anchor moves
+        every layer)."""
+        if not self.save_anchor or Vector(self.offset).length < 1e-5:
+            return
+        fitted = [st for _bm, st in self._states if "ah_fitted_from" in st.obj]
+        st = next((st for st in fitted if st.obj == context.edit_object), fitted[0] if fitted else None)
+        if st is None:
+            return
+        s = context.scene.avatar_helper
+        start, end = st.surface_point(), st.surface_point(st.moved(self.offset))
+        marker = bpy.data.objects.get(self.anchor) if self.anchor else None
+        if marker is not None and anchors.VERTS in marker:  # Adjust Last Operation: the same anchor
+            anchors.place(marker, start, end)
+        else:
+            marker = anchors.create(context, touchup.original_of(st.obj), np.nonzero(st.selected)[0], start, end,
+                                    s.target_body, calibration.target_armature(s), radius=self.falloff)
+            self.anchor = marker.name
+
+    def execute(self, context):
+        try:
+            self._prepare(context)
+            self._apply(self.offset)
+            self._save_anchor(context)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        return {'FINISHED'}
+
+    def invoke(self, context, event):
+        try:
+            self._prepare(context)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        # Run from the sidebar, the context's region is the sidebar's: drag in the viewport's.
+        self._region = next((r for r in context.area.regions if r.type == 'WINDOW'), context.region)
+        self._view = context.space_data.region_3d
+        self._pivot = Vector(np.mean([st.world[st.selected].mean(0) for _bm, st in self._states], axis=0).tolist())
+        self._mouse = self._mouse_at(event)
+        self._total = Vector((0.0, 0.0, 0.0))
+        self._vertical = False
+        context.window_manager.modal_handler_add(self)
+        self._header(context)
+        return {'RUNNING_MODAL'}
+
+    def _mouse_at(self, event):
+        return event.mouse_x - self._region.x, event.mouse_y - self._region.y
+
+    def _drag(self):
+        return Vector((0.0, 0.0, self._total.z)) if self._vertical else self._total.copy()
+
+    def _header(self, context):
+        context.area.header_text_set(
+            f"Slide Along Body: {self._drag().length * 100:.1f} cm{' (up and down only)' if self._vertical else ''}"
+            "    Click: confirm    Right-click/Esc: cancel    Z: up and down only    Shift: precise")
+
+    def modal(self, context, event):
+        if event.type == 'MOUSEMOVE':
+            xy = self._mouse_at(event)
+            here = view3d_utils.region_2d_to_location_3d(self._region, self._view, xy, self._pivot)
+            before = view3d_utils.region_2d_to_location_3d(self._region, self._view, self._mouse, self._pivot)
+            self._mouse = xy
+            self._total += (here - before) * (0.1 if event.shift else 1.0)
+        elif event.type == 'Z' and event.value == 'PRESS':
+            self._vertical = not self._vertical
+        elif event.type in {'LEFTMOUSE', 'RET', 'NUMPAD_ENTER'} and event.value == 'PRESS':
+            context.area.header_text_set(None)
+            self.offset = self._drag()
+            self._save_anchor(context)
+            return {'FINISHED'}
+        elif event.type in {'RIGHTMOUSE', 'ESC'} and event.value == 'PRESS':
+            context.area.header_text_set(None)
+            self._apply(None)
+            return {'CANCELLED'}
+        else:
+            return {'RUNNING_MODAL'}
+        self._apply(self._drag())
+        self._header(context)
+        return {'RUNNING_MODAL'}
+
+
+class AH_OT_add_anchor(bpy.types.Operator):
+    bl_idname = "avatar_helper.add_anchor"
+    bl_label = "Add Anchor"
+    bl_description = ("Mark the selected part of a fitted garment: a marker appears on the skin where it is now. "
+                      "Drag the marker (G) over the skin to where the part should be, then Fit Clothing again")
+    bl_options = {'REGISTER', 'UNDO'}
+
+    @classmethod
+    def poll(cls, context):
+        o = context.edit_object
+        return o is not None and o.type == 'MESH' and "ah_fitted_from" in o
+
+    def execute(self, context):
+        s = context.scene.avatar_helper
+        obj = context.edit_object
+        if not s.target_body:
+            self.report({'ERROR'}, "Set your avatar's body first")
+            return {'CANCELLED'}
+        try:
+            garment = touchup.original_of(obj)
+        except ValueError as e:
+            self.report({'ERROR'}, str(e))
+            return {'CANCELLED'}
+        _bm, coords, selected, edges = _edit_arrays(obj)
+        if not selected.any():
+            self.report({'ERROR'}, "Select the part of the fitted garment to anchor first")
+            return {'CANCELLED'}
+        part = touchup.SlideAlongBody(obj, coords, selected, edges, 0.0, touchup.slide_walker(context, s.target_body))
+        here = part.surface_point()
+        bpy.ops.object.mode_set(mode='OBJECT')
+        marker = anchors.create(context, garment, np.nonzero(selected)[0], here, here, s.target_body,
+                                calibration.target_armature(s))
+        for o in context.selected_objects:
+            o.select_set(False)
+        marker.select_set(True)
+        context.view_layer.objects.active = marker
+        self.report({'INFO'}, f"Added '{marker.name}': move it (G) over the skin to where this part should be, "
+                              "then Fit Clothing again")
+        return {'FINISHED'}
+
+
+class AH_OT_select_anchor(bpy.types.Operator):
+    bl_idname = "avatar_helper.select_anchor"
+    bl_label = "Select Anchor"
+    bl_description = "Select this anchor's marker, to move it (G)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: bpy.props.StringProperty()
+
+    def execute(self, context):
+        marker = bpy.data.objects.get(self.name)
+        if marker is None or marker.name not in context.view_layer.objects:
+            return {'CANCELLED'}
+        _ensure_object_mode(context)
+        for o in context.selected_objects:
+            o.select_set(False)
+        marker.hide_set(False)
+        marker.select_set(True)
+        context.view_layer.objects.active = marker
+        return {'FINISHED'}
+
+
+class AH_OT_remove_anchor(bpy.types.Operator):
+    bl_idname = "avatar_helper.remove_anchor"
+    bl_label = "Remove Anchor"
+    bl_description = "Delete this anchor (the fitted clothing changes at the next Fit Clothing)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    name: bpy.props.StringProperty()
+
+    def execute(self, _context):
+        marker = bpy.data.objects.get(self.name)
+        if marker is None or anchors.VERTS not in marker:
+            return {'CANCELLED'}
+        bpy.data.objects.remove(marker, do_unlink=True)
+        return {'FINISHED'}
+
+
+class AH_OT_clear_anchors(bpy.types.Operator):
+    bl_idname = "avatar_helper.clear_anchors"
+    bl_label = "Clear Anchors"
+    bl_description = "Delete all anchors (the fitted clothing changes at the next Fit Clothing)"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def invoke(self, context, event):
+        return context.window_manager.invoke_confirm(self, event)
+
+    def execute(self, _context):
+        for marker in anchors.anchor_objects():
+            bpy.data.objects.remove(marker, do_unlink=True)
+        return {'FINISHED'}
+
+
 def _unique_clothing(s):
     objs = []
     for it in s.clothing:
@@ -399,6 +647,9 @@ class AH_OT_fit(bpy.types.Operator):
             self.report({'ERROR'}, str(e))
             return {'CANCELLED'}
         msg = f"Fitted {len(meshes)} mesh(es) and {len(arms)} armature(s) into '{fitting.FITTED_COLLECTION}'"
+        used = anchors.anchors_for(objs)
+        if used:
+            msg += f" with {len(used)} anchor(s)"
         if shoes:
             msg += "; placed as shoes: " + ", ".join(shoes)
         self.report({'INFO'}, msg)
@@ -577,6 +828,11 @@ classes = (
     AH_OT_report_bug,
     AH_OT_finalize,
     AH_OT_restore_shape,
+    AH_OT_slide_along_body,
+    AH_OT_add_anchor,
+    AH_OT_select_anchor,
+    AH_OT_remove_anchor,
+    AH_OT_clear_anchors,
     AH_OT_clothing_add,
     AH_OT_clothing_remove,
     AH_OT_clothing_move,

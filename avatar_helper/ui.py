@@ -1,8 +1,9 @@
 import os
 
 import bpy
+import numpy as np
 
-from . import calibration, conversions, rig, updater
+from . import anchors, calibration, conversions, rig, updater
 from .calibration import CALIBRATION_KEY
 
 _names = {}  # conversion file stem -> display name, read once per file
@@ -187,6 +188,42 @@ class AH_PT_touchup(_Panel, bpy.types.Panel):
             return
         layout.label(text="Select the bumpy part (e.g. a hem):", icon='INFO')
         layout.operator("avatar_helper.restore_shape", icon='MOD_SMOOTH')
+        layout.label(text="Or a part in the wrong place (e.g. a band):", icon='INFO')
+        row = layout.row(align=True)
+        row.operator("avatar_helper.slide_along_body", icon='VIEW_PAN')
+        row.operator("avatar_helper.add_anchor", text="", icon='PINNED')
+
+
+class AH_PT_anchors(_Panel, bpy.types.Panel):
+    bl_label = "Anchors"
+    bl_parent_id = "AH_PT_fit"
+    bl_options = {'DEFAULT_CLOSED'}
+
+    def draw(self, context):
+        layout = self.layout
+        markers = anchors.anchor_objects()
+        if not markers:
+            col = layout.column(align=True)
+            col.label(text="A part of a garment ends up in the wrong place?", icon='INFO')
+            col.label(text="Select it on the fitted garment (Edit Mode),")
+            col.label(text="then Add Anchor, or Touch Up > Slide Along Body")
+        if context.mode == 'EDIT_MESH':
+            layout.operator("avatar_helper.add_anchor", icon='PINNED')
+        for m in markers:
+            col = layout.column(align=True)
+            row = col.row(align=True)
+            row.operator("avatar_helper.select_anchor", text=m.name, icon='PINNED').name = m.name
+            row.operator("avatar_helper.remove_anchor", text="", icon='X').name = m.name
+            row = col.row(align=True)
+            if m.ah_anchor.garment is None:
+                row.label(text="Its garment was deleted", icon='ERROR')
+            else:
+                row.label(text=f"Moved {np.linalg.norm(anchors.offset(m)) * 100:.1f} cm")
+            row.prop(m.ah_anchor, "radius", text="")
+            row.prop(m.ah_anchor, "mirror", text="", icon='MOD_MIRROR')
+        if markers:
+            layout.label(text="Drag a marker over the skin, then fit again", icon='INFO')
+            layout.operator("avatar_helper.clear_anchors", icon='TRASH')
 
 
 class AH_PT_help(_Panel, bpy.types.Panel):
@@ -226,8 +263,8 @@ class AH_PT_fit_advanced(_Panel, bpy.types.Panel):
         col.prop(s, "hide_originals")
 
 
-classes = (AH_UL_clothing, AH_PT_main, AH_PT_create, AH_PT_create_advanced, AH_PT_fit, AH_PT_fit_advanced,
-           AH_PT_touchup, AH_PT_help)
+classes = (AH_UL_clothing, AH_PT_main, AH_PT_create, AH_PT_create_advanced, AH_PT_fit, AH_PT_anchors,
+           AH_PT_fit_advanced, AH_PT_touchup, AH_PT_help)
 
 
 def register():

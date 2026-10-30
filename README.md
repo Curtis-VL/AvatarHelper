@@ -97,6 +97,32 @@ Some other settings to consider:
 - *Keep Outside Body*: points that were outside the avatar's body stay outside it (by up to Min Gap). Parts
   tucked inside the body by design are left as fitted.
 
+### Moving a part up or down the body
+
+A fit keeps each part of the clothing in the same place on the body as on the base, for example a bra band
+at the same spot on the breast. When the two bodies are shaped differently, that may not be what the design
+intends: the band no longer covers what it should, or stockings end too low on longer legs.
+
+**Slide Along Body** (quick, no refit): select the fitted mesh, enter Edit Mode, select the part (e.g. the
+band's lower edge, or the stocking's top edge loop) and press **Touch Up → Slide Along Body**. Move the mouse
+to drag it over the skin, then click to confirm (right-click cancels). The part keeps its distance from the
+body instead of sinking in or lifting off. *Z* limits it to up and down, and holding *Shift* drags more
+finely. *Falloff* (3 cm) sets how much of the clothing around the selection comes along.
+
+**Anchors** (kept for every later fit): by default, Slide Along Body also leaves an anchor (*Keep for Next
+Fit*), so when you click 'Fit Clothing' again the part goes back to where you slid it. You can also add one
+yourself. Select the part on the fitted mesh in Edit Mode, press **Add Anchor**, then move the marker that
+appears (G). It stays on the skin. Click 'Fit Clothing' again.
+
+An anchor moves the body underneath the part, not just the part itself, so clothing over or under it (a top
+over a bra) moves with it. Loose layers follow less closely. In the *Anchors* panel under Fit Clothing:
+- *Radius* (4 cm, or the Falloff used when sliding): how far around the part the change fades out. Lower it
+  to keep nearby parts in place, e.g. the bottom of a cutout.
+- *Mirror*: also moves the same part on the other side of the body.
+- Anchors stack: each one is measured on a fit that already includes the earlier ones, so fit again before
+  adding another anchor nearby.
+- Undoing a slide doesn't remove its anchor. Delete it from the list (or untick Keep for Next Fit).
+
 ### Controls that matter most
 
 | Setting | Effect |
@@ -117,7 +143,8 @@ In *Advanced* (under Fit Clothing):
 
 - Shoes will not be fitted correctly. They will be scaled to the right size, but will need some manual adjustment!
 - Items attached to the head may not be in the correct location or may be warped.
-- Bras/bikini tops may not be in the perfect location and may need moving up or down a little manually.
+- Bras/bikini tops may not be in the perfect location and may need moving up or down a little. Use Slide
+  Along Body or an anchor (see *Moving a part up or down the body*).
 
 ## AI usage
 

@@ -82,6 +82,20 @@ class AH_BodyKey(bpy.types.PropertyGroup):
     hides: BoolProperty(name="Hides the Body")
 
 
+class AH_Anchor(bpy.types.PropertyGroup):
+    """Settings of an anchor marker (see anchors.py), kept on the marker object."""
+    garment: PointerProperty(
+        name="Garment", type=bpy.types.Object, poll=_is_mesh,
+        description="The original garment whose vertices the anchor holds")
+    radius: FloatProperty(
+        name="Radius", default=0.04, min=0.0, soft_max=0.2, subtype='DISTANCE', unit='LENGTH',
+        description="How far around the anchored part the body mapping slides along with it, fading out. "
+                    "Smaller keeps nearby parts (e.g. the bottom of a cutout) where they are")
+    mirror: BoolProperty(
+        name="Mirror", default=False,
+        description="Also move the same part on the other side of the body, mirrored")
+
+
 def _show_calibration(self, _context):
     if self.calibration and self.calibration.name in bpy.context.view_layer.objects:
         self.calibration.hide_set(not self.show_calibration)
@@ -201,16 +215,18 @@ class AH_Preferences(bpy.types.AddonPreferences):
         updater.draw(box)
 
 
-classes = (AH_ClothingItem, AH_BodyKey, AH_Settings, AH_Preferences)
+classes = (AH_ClothingItem, AH_BodyKey, AH_Anchor, AH_Settings, AH_Preferences)
 
 
 def register():
     for c in classes:
         bpy.utils.register_class(c)
     bpy.types.Scene.avatar_helper = PointerProperty(type=AH_Settings)
+    bpy.types.Object.ah_anchor = PointerProperty(type=AH_Anchor)
 
 
 def unregister():
+    del bpy.types.Object.ah_anchor
     del bpy.types.Scene.avatar_helper
     for c in reversed(classes):
         bpy.utils.unregister_class(c)
