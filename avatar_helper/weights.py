@@ -15,6 +15,7 @@ from .rig import armature_map, bone_depth
 
 MAX_INFLUENCES = 4  # bones per vertex, as Unity skins with
 WEIGHT_SMOOTHING = 2  # neighbour-averaging passes, so weights don't jump between pieces
+REST_TOLERANCE = 1e-4  # per pose matrix element; about 0.006 degrees or 0.1 mm
 
 
 def _smoothstep_falloff(dist, inner, blend):
@@ -22,8 +23,11 @@ def _smoothstep_falloff(dist, inner, blend):
     return 1.0 - t * t * (3.0 - 2.0 * t)
 
 
-def is_rest(arm):
-    return all(pb.matrix_basis == Matrix.Identity(4) for pb in arm.pose.bones)
+def posed_bones(arm):
+    """Names of the bones moved from their rest pose. Imported rigs (FBX) keep float noise in
+    their pose channels even when never posed, so an exact comparison would flag every bone."""
+    return [pb.name for pb in arm.pose.bones
+            if np.abs(np.array(pb.matrix_basis) - np.eye(4)).max() > REST_TOLERANCE]
 
 
 def vertex_weights(obj, bones):
@@ -59,8 +63,10 @@ def rig_to_avatar(context, meshes, avatar_arm, body, body_mask, skin_distance, b
     """Rebind fitted meshes (bound to fitted outfit armatures) to `avatar_arm`. `body` is the
     avatar's body mesh, `body_mask` which of its vertices are body (not hair or accessories).
     Returns the outfit bones added to the avatar's armature."""
-    if not is_rest(avatar_arm):
-        raise ValueError(f"Put '{avatar_arm.name}' in its rest pose first (Pose Mode > Pose > Clear Transform)")
+    posed = posed_bones(avatar_arm)
+    if posed:
+        raise ValueError(f"Put '{avatar_arm.name}' in its rest pose first: {len(posed)} bone(s) posed, e.g. '{posed[0]}' "
+                         "(Pose Mode > Select > All > Pose > Clear Transform > All; hidden bones must be unhidden)")
     deform = [b.name for b in avatar_arm.data.bones if b.use_deform]
     dg = context.evaluated_depsgraph_get()
     bv, bt, _be = mu.evaluated_mesh_world(body, dg)
